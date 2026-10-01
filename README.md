@@ -50,3 +50,40 @@ python3 -m supply_guard.cli --database catalog.db impact --service api --ecosyst
 Each impact record carries the affected component identity, the vulnerability
 id and matched name, the severity, whether the hit is direct, and the
 shortest dependency path from the component to a directly hit component.
+
+## Local OSV advisories
+
+Import a JSON file holding an array of OSV records under a named source. The
+source applies catalog-wide (across every service). Re-importing the same
+source replaces all of its records; an empty array clears it; other sources
+and manual vulnerabilities are kept.
+
+```bash
+python3 -m supply_guard.cli --database catalog.db import-osv internal-advisory osv.json
+```
+
+Only PyPI packages are matched. Package names are case-insensitive and treat
+runs of dots, underscores and hyphens as equivalent (`Django_Foo` matches
+`django-foo`); npm components with the same name are never direct hits.
+Versions follow PEP 440 ordering (pre-releases and local versions included),
+and both `affected[].versions` and `ECOSYSTEM` ranges are matched as a union.
+An interval includes `introduced`, excludes `fixed`, includes
+`last_affected`; `"introduced": "0"` means no lower bound and a trailing
+`introduced` leaves no upper bound, so a fix can be re-introduced later.
+
+Records need a non-empty `id`. Severity is read from
+`database_specific.severity` (`low`/`medium`/`high`/`critical`); when missing
+it defaults to `medium` and the impact record marks the default. Records with
+a valid `withdrawn` timestamp no longer participate. Any other ecosystem,
+range type, event kind, unparseable advisory version, inverted interval or
+illegal event order rejects the whole import without touching existing data.
+A candidate component whose version cannot be parsed makes `impact` and
+`summary` fail and names the component.
+
+`impact` shows imported advisories per source: each (component, source,
+vulnerability id, matched package) appears once, carrying the shortest
+dependency path, the terminal matched version condition and the severity
+basis. `summary` counts imported vulnerabilities by (id, normalized package)
+over records that actually hit; manual vulnerabilities keep their original
+rules and are counted separately even when they share an id.
+

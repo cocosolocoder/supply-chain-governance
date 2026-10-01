@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import itertools
 import json
+import re
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -47,6 +50,42 @@ CREATE TABLE IF NOT EXISTS dependency_sources (
     dependency_id INTEGER NOT NULL REFERENCES dependencies(id) ON DELETE CASCADE,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     PRIMARY KEY(dependency_id, source_id)
+);
+CREATE TABLE IF NOT EXISTS osv_sources (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS osv_vulnerabilities (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES osv_sources(id) ON DELETE CASCADE,
+    vid TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    severity_defaulted INTEGER NOT NULL DEFAULT 0,
+    withdrawn TEXT,
+    UNIQUE(source_id, vid)
+);
+CREATE TABLE IF NOT EXISTS osv_affected (
+    id INTEGER PRIMARY KEY,
+    osv_vulnerability_id INTEGER NOT NULL REFERENCES osv_vulnerabilities(id) ON DELETE CASCADE,
+    package_name TEXT NOT NULL,
+    UNIQUE(osv_vulnerability_id, package_name)
+);
+CREATE TABLE IF NOT EXISTS osv_versions (
+    osv_affected_id INTEGER NOT NULL REFERENCES osv_affected(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    PRIMARY KEY(osv_affected_id, version)
+);
+CREATE TABLE IF NOT EXISTS osv_ranges (
+    id INTEGER PRIMARY KEY,
+    osv_affected_id INTEGER NOT NULL REFERENCES osv_affected(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS osv_events (
+    id INTEGER PRIMARY KEY,
+    range_id INTEGER NOT NULL REFERENCES osv_ranges(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    introduced TEXT,
+    fixed TEXT,
+    last_affected TEXT
 );
 """
 
@@ -219,6 +258,468 @@ def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tupl
             edges.add((dependent_identity, dependency_identity))
 
     return identity_set, edges
+
+
+# --- PEP 440 version comparison ---------------------------------------------
+#
+# A self-contained implementation of the PEP 440 ordering rules (the project
+# ships without third-party dependencies). Comparison keys mirror the standard
+# packaging semantics, including pre/post/dev releases and local versions.
+
+_VERSION_PATTERN = r"""
+    v?
+    (?:
+        (?:(?P<epoch>[0-9]+)!)?
+        (?P<release>[0-9]+(?:\.[0-9]+)*)
+        (?P<pre>
+            [-_\.]?
+            (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
+            [-_\.]?
+            (?P<pre_n>[0-9]+)?
+        )?
+        (?P<post>
+            (?:-(?P<post_n1>[0-9]+))
+            |
+            (?:
+                [-_\.]?
+                (?P<post_l>post|rev|r)
+                [-_\.]?
+                (?P<post_n2>[0-9]+)?
+            )
+        )?
+        (?P<dev>
+            [-_\.]?
+            (?P<dev_l>dev)
+            [-_\.]?
+            (?P<dev_n>[0-9]+)?
+        )?
+    )
+    (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?
+"""
+_VERSION_RE = re.compile(
+    r"^\s*" + _VERSION_PATTERN + r"\s*$", re.VERBOSE | re.IGNORECASE
+)
+_LOCAL_SEPARATORS = re.compile(r"[._-]")
+
+
+class InvalidVersion(ValueError):
+    """Raised when a string is not a valid PEP 440 version."""
+
+
+class _Infinity:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "Infinity"
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Infinity)
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    def __neg__(self) -> "_NegativeInfinity":
+        return _NEGATIVE_INFINITY
+
+    def __hash__(self) -> int:
+        return hash("Infinity")
+
+
+class _NegativeInfinity:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "-Infinity"
+
+    def __lt__(self, other: object) -> bool:
+        return True
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _NegativeInfinity)
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+    def __ge__(self, other: object) -> bool:
+        return False
+
+    def __hash__(self) -> int:
+        return hash("-Infinity")
+
+
+_INFINITY = _Infinity()
+_NEGATIVE_INFINITY = _NegativeInfinity()
+
+
+def _parse_letter_version(letter, number):
+    if letter:
+        if number is None:
+            number = 0
+        letter = letter.lower()
+        if letter == "alpha":
+            letter = "a"
+        elif letter == "beta":
+            letter = "b"
+        elif letter in ("c", "pre", "preview"):
+            letter = "rc"
+        elif letter in ("rev", "r"):
+            letter = "post"
+        return letter, int(number)
+    if not letter and number:
+        return "post", int(number)
+    return None
+
+
+def _parse_local_version(local):
+    if local is not None:
+        return tuple(
+            part.lower() if not part.isdigit() else int(part)
+            for part in _LOCAL_SEPARATORS.split(local)
+        )
+    return None
+
+
+def _cmpkey(epoch, release, pre, post, dev, local):
+    trimmed = tuple(
+        reversed(list(itertools.dropwhile(lambda x: x == 0, reversed(release))))
+    )
+    if pre is None and post is None and dev is not None:
+        pre_key = _NEGATIVE_INFINITY
+    elif pre is None:
+        pre_key = _INFINITY
+    else:
+        pre_key = pre
+    post_key = _NEGATIVE_INFINITY if post is None else post
+    dev_key = _INFINITY if dev is None else dev
+    if local is None:
+        local_key = _NEGATIVE_INFINITY
+    else:
+        local_key = tuple(
+            (segment, "") if isinstance(segment, int) else (_NEGATIVE_INFINITY, segment)
+            for segment in local
+        )
+    return epoch, trimmed, pre_key, post_key, dev_key, local_key
+
+
+def parse_pep440(version: object):
+    """Parse a PEP 440 version string into an opaque, comparable key.
+
+    Raises InvalidVersion (a ValueError) when the string cannot be parsed.
+    """
+    if not isinstance(version, str) or not version.strip():
+        raise InvalidVersion(f"无效的版本: {version!r}")
+    match = _VERSION_RE.search(version)
+    if match is None:
+        raise InvalidVersion(f"无效的 PEP 440 版本: {version!r}")
+    return _cmpkey(
+        int(match.group("epoch")) if match.group("epoch") else 0,
+        tuple(int(part) for part in match.group("release").split(".")),
+        _parse_letter_version(match.group("pre_l"), match.group("pre_n")),
+        _parse_letter_version(
+            match.group("post_l"),
+            match.group("post_n1") or match.group("post_n2"),
+        ),
+        _parse_letter_version(match.group("dev_l"), match.group("dev_n")),
+        _parse_local_version(match.group("local")),
+    )
+
+
+def normalize_pypi_name(name: str) -> str:
+    """PEP 503 style normalization: case-insensitive, runs of ._- equivalent."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+# --- OSV record parsing ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OsvAffected:
+    package: str
+    versions: tuple[str, ...]
+    # One tuple of events per ECOSYSTEM range; intervals never cross ranges.
+    ranges: tuple[tuple[tuple[str, str | None], ...], ...]
+
+
+@dataclass(frozen=True)
+class OsvRecord:
+    id: str
+    severity: str
+    severity_defaulted: bool
+    withdrawn: str | None
+    affected: tuple[OsvAffected, ...]
+
+
+VALID_SEVERITIES = ("low", "medium", "high", "critical")
+
+
+def _require_object(value, label: str, record_id: str | None) -> dict:
+    if not isinstance(value, dict):
+        where = f"记录 {record_id} " if record_id is not None else ""
+        raise ValueError(f"{where}{label} 必须是对象")
+    return value
+
+
+def _require_list(value, label: str, record_id: str) -> list:
+    if not isinstance(value, list):
+        raise ValueError(f"记录 {record_id} {label} 必须是数组")
+    return value
+
+
+def _parse_withdrawn(value, record_id: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"记录 {record_id} withdrawn 必须是非空字符串")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        datetime.fromisoformat(text)
+    except ValueError as error:
+        raise ValueError(f"记录 {record_id} withdrawn 时间无效: {value}") from error
+    return value.strip()
+
+
+def _event_bound(
+    value, record_id: str, kind: str, index: int
+) -> str | None:
+    """Return the normalized value of an introduced/fixed/last_affected event."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"记录 {record_id} affected[{index}] ranges 事件 {kind} 值必须是非空字符串"
+        )
+    text = value.strip()
+    if kind != "introduced" or text != "0":
+        try:
+            parse_pep440(text)
+        except InvalidVersion as error:
+            raise ValueError(
+                f"记录 {record_id} affected[{index}] ranges 事件 {kind} 版本无法解析: "
+                f"{value}"
+            ) from error
+    return text
+
+
+def _parse_range_events(events, record_id: str, index: int):
+    events = _require_list(events, "ranges[].events", record_id)
+    if not events:
+        raise ValueError(
+            f"记录 {record_id} affected[{index}] ranges 的 events 不能为空"
+        )
+    parsed: list[tuple[str, str | None]] = []
+    for event_index, event in enumerate(events):
+        event = _require_object(
+            event, f"ranges[].events[{event_index}]", record_id
+        )
+        known = ("introduced", "fixed", "last_affected")
+        kinds = [kind for kind in known if kind in event]
+        if len(kinds) != 1:
+            raise ValueError(
+                f"记录 {record_id} affected[{index}] events[{event_index}] "
+                "必须只包含 introduced/fixed/last_affected 之一"
+            )
+        kind = kinds[0]
+        extras = [key for key in event if key not in known]
+        if extras:
+            raise ValueError(
+                f"记录 {record_id} affected[{index}] events[{event_index}] "
+                f"含不支持的事件字段: {', '.join(sorted(extras))}"
+            )
+        parsed.append((kind, _event_bound(event[kind], record_id, kind, index)))
+    return tuple(parsed)
+
+
+def _parse_osv_record(record: object, index: int) -> OsvRecord:
+    location = f"records[{index}]"
+    if not isinstance(record, dict):
+        raise ValueError(f"{location} 必须是对象")
+    identifier = record.get("id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise ValueError(f"{location} 缺少非空 id")
+    record_id = identifier.strip()
+
+    database_specific = record.get("database_specific")
+    severity = "medium"
+    severity_defaulted = True
+    if database_specific is not None:
+        database_specific = _require_object(
+            database_specific, "database_specific", record_id
+        )
+        if "severity" in database_specific:
+            raw = database_specific["severity"]
+            if not isinstance(raw, str) or raw.strip().lower() not in VALID_SEVERITIES:
+                raise ValueError(
+                    f"记录 {record_id} severity 必须是 low/medium/high/critical 之一"
+                )
+            severity = raw.strip().lower()
+            severity_defaulted = False
+
+    withdrawn = _parse_withdrawn(record.get("withdrawn"), record_id)
+
+    affected_entries = record.get("affected", [])
+    if "affected" in record:
+        affected_entries = _require_list(affected_entries, "affected", record_id)
+    affected: list[OsvAffected] = []
+    for affected_index, entry in enumerate(affected_entries):
+        entry = _require_object(entry, f"affected[{affected_index}]", record_id)
+        package = entry.get("package")
+        package = _require_object(package, f"affected[{affected_index}].package", record_id)
+        ecosystem = package.get("ecosystem")
+        if not isinstance(ecosystem, str) or not ecosystem.strip():
+            raise ValueError(
+                f"记录 {record_id} affected[{affected_index}] 缺少非空 ecosystem"
+            )
+        if ecosystem.strip().lower() != "pypi":
+            raise ValueError(
+                f"记录 {record_id} affected[{affected_index}] 不支持的生态: {ecosystem}"
+            )
+        name = package.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"记录 {record_id} affected[{affected_index}] 缺少非空 PyPI 包名"
+            )
+        name = name.strip()
+
+        versions: list[str] = []
+        if "versions" in entry:
+            raw_versions = _require_list(
+                entry["versions"], f"affected[{affected_index}].versions", record_id
+            )
+            for raw_version in raw_versions:
+                if not isinstance(raw_version, str) or not raw_version.strip():
+                    raise ValueError(
+                        f"记录 {record_id} affected[{affected_index}] "
+                        "versions 必须为非空字符串数组"
+                    )
+                text = raw_version.strip()
+                try:
+                    parse_pep440(text)
+                except InvalidVersion as error:
+                    raise ValueError(
+                        f"记录 {record_id} affected[{affected_index}] "
+                        f"漏洞版本无法解析: {raw_version}"
+                    ) from error
+                if text not in versions:
+                    versions.append(text)
+
+        ranges_events: list[tuple[tuple[str, str | None], ...]] = []
+        if "ranges" in entry:
+            ranges = _require_list(
+                entry["ranges"], f"affected[{affected_index}].ranges", record_id
+            )
+            for range_entry in ranges:
+                range_entry = _require_object(
+                    range_entry,
+                    f"affected[{affected_index}].ranges[]",
+                    record_id,
+                )
+                range_type = range_entry.get("type")
+                if range_type != "ECOSYSTEM":
+                    raise ValueError(
+                        f"记录 {record_id} affected[{affected_index}] "
+                        f"不支持的 range 类型: {range_type}"
+                    )
+                range_events = _parse_range_events(
+                    range_entry.get("events"), record_id, affected_index
+                )
+                _validate_range_order(range_events, record_id, affected_index)
+                ranges_events.append(range_events)
+
+        if not versions and not ranges_events:
+            raise ValueError(
+                f"记录 {record_id} affected[{affected_index}] 没有有效的版本条件"
+            )
+        affected.append(OsvAffected(name, tuple(versions), tuple(ranges_events)))
+
+    if not affected:
+        raise ValueError(f"记录 {record_id} 缺少有效的 affected 条目")
+
+    # Merge entries that reference the exact same PyPI package: their explicit
+    # versions and ranges already combine as a union when matching.
+    merged: dict[str, OsvAffected] = {}
+    order: list[str] = []
+    for entry in affected:
+        if entry.package in merged:
+            current = merged[entry.package]
+            versions = list(current.versions)
+            for version in entry.versions:
+                if version not in versions:
+                    versions.append(version)
+            merged[entry.package] = OsvAffected(
+                entry.package,
+                tuple(versions),
+                current.ranges + entry.ranges,
+            )
+        else:
+            merged[entry.package] = entry
+            order.append(entry.package)
+    affected_entries = tuple(merged[package] for package in order)
+    return OsvRecord(
+        record_id, severity, severity_defaulted, withdrawn, affected_entries
+    )
+
+
+def _validate_range_order(events, record_id: str, index: int) -> None:
+    """Validate the event stream and the intervals it describes.
+
+    introduced opens an interval, fixed/last_affected closes it. A fixed
+    version must be strictly greater than its introducing version and an
+    interval may not be fixed before it is (re)introduced.
+    """
+    opened: str | None = None
+    for event_index, (kind, value) in enumerate(events):
+        if kind == "introduced":
+            if opened is not None:
+                raise ValueError(
+                    f"记录 {record_id} affected[{index}] events[{event_index}] "
+                    "在区间未结束时再次 introduced"
+                )
+            opened = value
+        else:
+            if opened is None:
+                raise ValueError(
+                    f"记录 {record_id} affected[{index}] events[{event_index}] "
+                    f"{kind} 之前没有 introduced"
+                )
+            if opened != "0" and parse_pep440(value) <= parse_pep440(opened):
+                raise ValueError(
+                    f"记录 {record_id} affected[{index}] 区间倒置: "
+                    f"{opened} 之后 {kind} {value}"
+                )
+            opened = None
+
+
+def parse_osv_documents(document: object) -> list[OsvRecord]:
+    """Validate an OSV document (a JSON array of records).
+
+    Every record is validated before anything is written, so a failed import
+    leaves existing data untouched.
+    """
+    if not isinstance(document, list):
+        raise ValueError("OSV 文件必须是记录数组")
+    records: list[OsvRecord] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(document):
+        record = _parse_osv_record(entry, index)
+        if record.id in seen:
+            raise ValueError(f"文件内漏洞 id 重复: {record.id}")
+        seen.add(record.id)
+        records.append(record)
+    return records
 
 
 class Catalog:
@@ -554,6 +1055,207 @@ class Catalog:
             raise ValueError(f"文件 {path} 不是有效的 JSON: {error}") from error
         return self.import_sbom(service, source_name, sbom)
 
+    # --- OSV imports -------------------------------------------------------
+
+    def import_osv(self, source_name: str, document: object) -> int:
+        """Replace every OSV record of ``source_name`` with ``document``.
+
+        The document is an array of OSV records. Validation of every record
+        completes before any write, so an invalid import leaves the catalog
+        untouched. An empty array clears the source. Records belonging to
+        other sources and manually registered vulnerabilities are preserved.
+        Returns the number of imported records.
+        """
+        source_name = source_name.strip() if isinstance(source_name, str) else ""
+        if not source_name:
+            raise ValueError("OSV 来源名称不能为空")
+        records = parse_osv_documents(document)
+
+        with self.connection:
+            source_row = self.connection.execute(
+                "SELECT id FROM osv_sources WHERE name = ?", (source_name,)
+            ).fetchone()
+            if source_row is None:
+                source_id = int(
+                    self.connection.execute(
+                        "INSERT INTO osv_sources(name) VALUES (?)", (source_name,)
+                    ).lastrowid
+                )
+            else:
+                source_id = int(source_row["id"])
+                # Cascades remove the previous records of this source.
+                self.connection.execute(
+                    "DELETE FROM osv_vulnerabilities WHERE source_id = ?",
+                    (source_id,),
+                )
+
+            for record in records:
+                vulnerability_id = int(
+                    self.connection.execute(
+                        "INSERT INTO osv_vulnerabilities"
+                        "(source_id, vid, severity, severity_defaulted, withdrawn) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            source_id,
+                            record.id,
+                            record.severity,
+                            1 if record.severity_defaulted else 0,
+                            record.withdrawn,
+                        ),
+                    ).lastrowid
+                )
+                # Rows are ordered deterministically so a repeated import of
+                # identical content keeps stable row ordering.
+                for affected_index, entry in enumerate(record.affected):
+                    affected_id = int(
+                        self.connection.execute(
+                            "INSERT INTO osv_affected(osv_vulnerability_id, package_name) "
+                            "VALUES (?, ?)",
+                            (vulnerability_id, entry.package),
+                        ).lastrowid
+                    )
+                    for version in entry.versions:
+                        self.connection.execute(
+                            "INSERT INTO osv_versions(osv_affected_id, version) "
+                            "VALUES (?, ?)",
+                            (affected_id, version),
+                        )
+                    for range_events in entry.ranges:
+                        range_id = int(
+                            self.connection.execute(
+                                "INSERT INTO osv_ranges(osv_affected_id) VALUES (?)",
+                                (affected_id,),
+                            ).lastrowid
+                        )
+                        for position, (kind, value) in enumerate(range_events):
+                            self.connection.execute(
+                                "INSERT INTO osv_events"
+                                "(range_id, position, introduced, fixed, last_affected) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (
+                                    range_id,
+                                    position,
+                                    value if kind == "introduced" else None,
+                                    value if kind == "fixed" else None,
+                                    value if kind == "last_affected" else None,
+                                ),
+                            )
+        return len(records)
+
+    def import_osv_file(self, source_name: str, path: str | Path) -> int:
+        """Read an OSV JSON file (an array of records) and import it."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except OSError as error:
+            raise ValueError(f"无法读取文件 {path}: {error}") from error
+        except json.JSONDecodeError as error:
+            raise ValueError(f"文件 {path} 不是有效的 JSON: {error}") from error
+        return self.import_osv(source_name, document)
+
+    def _osv_entries(self):
+        """Load active OSV records as (source, vid, severity, defaulted, entries).
+
+        Each entry is (affected_pk, package, versions, ranges) where ranges is
+        a list of ordered (kind, value) event lists grouped by range.
+        """
+        sources = {
+            int(row["id"]): str(row["name"])
+            for row in self.connection.execute("SELECT id, name FROM osv_sources")
+        }
+        vulnerability_rows = self.connection.execute(
+            "SELECT id, source_id, vid, severity, severity_defaulted, withdrawn "
+            "FROM osv_vulnerabilities ORDER BY source_id, vid"
+        ).fetchall()
+        loaded = []
+        for vulnerability in vulnerability_rows:
+            if vulnerability["withdrawn"] is not None:
+                continue
+            entries = []
+            affected_rows = self.connection.execute(
+                "SELECT id, package_name FROM osv_affected WHERE osv_vulnerability_id = ?",
+                (int(vulnerability["id"]),),
+            ).fetchall()
+            for affected in affected_rows:
+                affected_id = int(affected["id"])
+                versions = tuple(
+                    str(row["version"])
+                    for row in self.connection.execute(
+                        "SELECT version FROM osv_versions WHERE osv_affected_id = ?",
+                        (affected_id,),
+                    )
+                )
+                ranges = []
+                range_rows = self.connection.execute(
+                    "SELECT id FROM osv_ranges WHERE osv_affected_id = ?", (affected_id,)
+                ).fetchall()
+                for range_row in range_rows:
+                    events = []
+                    event_rows = self.connection.execute(
+                        "SELECT introduced, fixed, last_affected FROM osv_events "
+                        "WHERE range_id = ? ORDER BY position",
+                        (int(range_row["id"]),),
+                    ).fetchall()
+                    for event in event_rows:
+                        if event["introduced"] is not None:
+                            events.append(("introduced", str(event["introduced"])))
+                        elif event["fixed"] is not None:
+                            events.append(("fixed", str(event["fixed"])))
+                        else:
+                            events.append(
+                                ("last_affected", str(event["last_affected"]))
+                            )
+                    ranges.append(events)
+                entries.append(
+                    (affected_id, str(affected["package_name"]), versions, ranges)
+                )
+            loaded.append(
+                (
+                    sources[int(vulnerability["source_id"])],
+                    str(vulnerability["vid"]),
+                    str(vulnerability["severity"]),
+                    bool(vulnerability["severity_defaulted"]),
+                    entries,
+                )
+            )
+        return loaded
+
+    @staticmethod
+    def _version_in_conditions(component_key, versions, ranges) -> tuple[bool, str]:
+        """Match a parsed component version against versions ∪ ECOSYSTEM ranges.
+
+        Returns (matched, description). The description identifies the exact
+        explicit version or interval that matched, e.g. ``version:1.2.3`` or
+        ``range:>=1.0,<2.0`` (an open lower bound is rendered ``>=0``).
+        """
+        for version in versions:
+            if component_key == parse_pep440(version):
+                return True, f"version:{version}"
+        for events in ranges:
+            lower_text = None
+            lower_key = None
+            for kind, value in events:
+                if kind == "introduced":
+                    lower_text = value
+                    lower_key = None if value == "0" else parse_pep440(value)
+                else:
+                    lower_label = "0" if lower_text is None else lower_text
+                    above_lower = lower_key is None or component_key >= lower_key
+                    if kind == "fixed":
+                        if above_lower and component_key < parse_pep440(value):
+                            return True, f"range:>={lower_label},<{value}"
+                    else:  # last_affected: closed upper bound
+                        if above_lower and component_key <= parse_pep440(value):
+                            return True, f"range:>={lower_label},<={value}"
+                    lower_text = None
+                    lower_key = None
+            # A trailing introduced leaves an interval without an upper bound.
+            if lower_text is not None and (
+                lower_key is None or component_key >= lower_key
+            ):
+                return True, f"range:>={lower_text}"
+        return False, ""
+
     def _components_by_id(self) -> dict[int, dict[str, str]]:
         rows = self.connection.execute(
             "SELECT id, service, ecosystem, name, version FROM components"
@@ -580,51 +1282,165 @@ class Catalog:
             reverse.setdefault(dependency, []).append(dependent)
         return forward, reverse
 
-    def _affected_ids(self) -> set[int]:
-        """Components directly hit by a vulnerability or depending on one that is."""
-        components = self._components_by_id()
+    def _osv_hit_groups(self, components):
+        """Group the direct OSV hits by (source, vulnerability, package).
+
+        Returns a list of ``(source, vid, severity, defaulted, norm_name,
+        seeds, conditions)`` where ``seeds`` is the set of directly hit
+        component ids for that normalized PyPI package and ``conditions`` maps
+        every seed to the version condition that matched it.
+
+        Raises ValueError naming the component when a candidate component
+        (pypi ecosystem, normalized name equal to an affected package) carries
+        a version that cannot be parsed as PEP 440.
+        """
+        version_keys: dict[int, object] = {}
+
+        def key_for(component_id: int):
+            if component_id not in version_keys:
+                try:
+                    version_keys[component_id] = parse_pep440(
+                        components[component_id]["version"]
+                    )
+                except InvalidVersion as error:
+                    component = components[component_id]
+                    raise ValueError(
+                        "组件版本无法解析: "
+                        + self._format_identity(
+                            (
+                                component["service"],
+                                component["ecosystem"],
+                                component["name"],
+                                component["version"],
+                            )
+                        )
+                    ) from error
+            return version_keys[component_id]
+
+        groups: dict[tuple[str, str, str], dict] = {}
+        for source, vid, severity, defaulted, entries in self._osv_entries():
+            for _affected_id, package, versions, ranges in entries:
+                norm_name = normalize_pypi_name(package)
+                group = groups.setdefault(
+                    (source, vid, norm_name),
+                    {
+                        "severity": severity,
+                        "defaulted": defaulted,
+                        "seeds": set(),
+                        "conditions": {},
+                    },
+                )
+                for component_id, component in components.items():
+                    if component["ecosystem"] != "pypi":
+                        # npm (and other) components can never be directly hit;
+                        # they may still be reached through propagation.
+                        continue
+                    if normalize_pypi_name(component["name"]) != norm_name:
+                        continue
+                    component_key = key_for(component_id)
+                    matched, description = self._version_in_conditions(
+                        component_key, versions, ranges
+                    )
+                    if matched:
+                        group["seeds"].add(component_id)
+                        # Keep the first matching condition when several
+                        # affected entries cover the same component.
+                        group["conditions"].setdefault(component_id, description)
+
+        return [
+            (source, vid, group["severity"], group["defaulted"], norm_name,
+             group["seeds"], group["conditions"])
+            for (source, vid, norm_name), group in groups.items()
+            if group["seeds"]
+        ]
+
+    @staticmethod
+    def _propagate(seeds, reverse) -> dict[int, int]:
+        """Multi-source BFS: fewest dependency hops from a seed to each node."""
+        distance: dict[int, int] = {component_id: 0 for component_id in seeds}
+        queue = deque(seeds)
+        while queue:
+            node = queue.popleft()
+            for dependent in reverse.get(node, ()):
+                if dependent not in distance:
+                    distance[dependent] = distance[node] + 1
+                    queue.append(dependent)
+        return distance
+
+    def _manual_seeds(self, components) -> dict[str, set[int]]:
         vulnerable_names = {
             str(row["component_name"])
             for row in self.connection.execute(
                 "SELECT DISTINCT component_name FROM vulnerabilities"
             )
         }
+        seeds: dict[str, set[int]] = {}
+        for component_id, component in components.items():
+            if component["name"] in vulnerable_names:
+                seeds.setdefault(component["name"], set()).add(component_id)
+        return seeds
+
+    def _affected_ids(self) -> set[int]:
+        """Components directly hit by a vulnerability or depending on one that is."""
+        components = self._components_by_id()
         _, reverse = self._dependency_edges()
-        affected = {
-            component_id
-            for component_id, component in components.items()
-            if component["name"] in vulnerable_names
-        }
-        queue = deque(affected)
-        while queue:
-            node = queue.popleft()
-            for dependent in reverse.get(node, ()):
-                if dependent not in affected:
-                    affected.add(dependent)
-                    queue.append(dependent)
+        affected: set[int] = set()
+        for seeds in self._manual_seeds(components).values():
+            affected.update(self._propagate(seeds, reverse))
+        # Also surfaces unparseable candidate versions as query errors.
+        for group in self._osv_hit_groups(components):
+            affected.update(self._propagate(group[5], reverse))
         return affected
 
     def summary(self) -> Summary:
-        affected = self._affected_ids()
+        components = self._components_by_id()
+        _, reverse = self._dependency_edges()
+
+        affected: set[int] = set()
+        highest_rank = 0
+
+        # Manually registered vulnerabilities keep their original matching and
+        # counting rules: one count per (id, component_name) that matches a
+        # component by name.
+        manual_count = 0
+        manual_rows = self.connection.execute(
+            "SELECT id, component_name, severity FROM vulnerabilities"
+        ).fetchall()
+        for observation in manual_rows:
+            matched_name = str(observation["component_name"])
+            seeds = [
+                component_id
+                for component_id, component in components.items()
+                if component["name"] == matched_name
+            ]
+            if not seeds:
+                continue
+            manual_count += 1
+            highest_rank = max(highest_rank, SEVERITY_RANK[str(observation["severity"])])
+            affected.update(self._propagate(seeds, reverse))
+
+        # Imported OSV records are counted once per (vulnerability id,
+        # normalized package) over the records that actually hit.
+        counted_imports: set[tuple[str, str]] = set()
+        for source, vid, severity, _defaulted, norm_name, seeds, _conditions in (
+            self._osv_hit_groups(components)
+        ):
+            affected.update(self._propagate(seeds, reverse))
+            highest_rank = max(highest_rank, SEVERITY_RANK[severity])
+            counted_imports.add((vid, norm_name))
+
+        highest_severity = next(
+            (name for name, rank in SEVERITY_RANK.items() if rank == highest_rank),
+            None,
+        )
         row = self.connection.execute(
-            """
-            SELECT
-              (SELECT COUNT(*) FROM components) AS components,
-              COUNT(*) AS vulnerabilities,
-              CASE MAX(CASE v.severity
-                WHEN 'critical' THEN 4 WHEN 'high' THEN 3
-                WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)
-                WHEN 4 THEN 'critical' WHEN 3 THEN 'high'
-                WHEN 2 THEN 'medium' WHEN 1 THEN 'low' ELSE NULL END AS highest_severity
-            FROM vulnerabilities v
-            WHERE EXISTS (SELECT 1 FROM components c WHERE c.name = v.component_name)
-            """
+            "SELECT COUNT(*) AS components FROM components"
         ).fetchone()
         return Summary(
             components=int(row["components"]),
             affected_components=len(affected),
-            vulnerabilities=int(row["vulnerabilities"]),
-            highest_severity=row["highest_severity"],
+            vulnerabilities=manual_count + len(counted_imports),
+            highest_severity=highest_severity,
         )
 
     def affected_services(self) -> list[str]:
@@ -638,6 +1454,29 @@ class Catalog:
             sorted(affected),
         )
         return [str(row["service"]) for row in rows]
+
+    @staticmethod
+    def _shortest_path(component_id, distance, forward, components) -> list[int]:
+        """Rebuild one shortest path to a distance-0 seed; ties break by identity."""
+        path_ids = [component_id]
+        while distance[path_ids[-1]] > 0:
+            current = path_ids[-1]
+            candidates = [
+                nxt
+                for nxt in forward.get(current, ())
+                if distance.get(nxt) == distance[current] - 1
+            ]
+            path_ids.append(
+                min(
+                    candidates,
+                    key=lambda nxt: (
+                        components[nxt]["ecosystem"],
+                        components[nxt]["name"],
+                        components[nxt]["version"],
+                    ),
+                )
+            )
+        return path_ids
 
     def impact(
         self,
@@ -659,59 +1498,67 @@ class Catalog:
 
         components = self._components_by_id()
         forward, reverse = self._dependency_edges()
-        observations = self.connection.execute(
-            """
-            SELECT v.id, v.component_name, v.severity
-            FROM vulnerabilities v
-            WHERE EXISTS (SELECT 1 FROM components c WHERE c.name = v.component_name)
-            ORDER BY v.id, v.component_name
-            """
-        ).fetchall()
 
         records: list[dict] = []
+
+        # Manually registered vulnerabilities: match by component name across
+        # every ecosystem, exactly as before.
+        observations = self.connection.execute(
+            "SELECT id, component_name, severity FROM vulnerabilities "
+            "ORDER BY id, component_name"
+        ).fetchall()
         for observation in observations:
             matched_name = str(observation["component_name"])
-            sources = [
+            seeds = [
                 component_id
                 for component_id, component in components.items()
                 if component["name"] == matched_name
             ]
-            # Multi-source BFS over reverse edges: distance = fewest dependency
-            # hops from an affected component to a directly hit one.
-            distance = {component_id: 0 for component_id in sources}
-            queue = deque(sources)
-            while queue:
-                node = queue.popleft()
-                for dependent in reverse.get(node, ()):
-                    if dependent not in distance:
-                        distance[dependent] = distance[node] + 1
-                        queue.append(dependent)
-
+            if not seeds:
+                continue
+            distance = self._propagate(seeds, reverse)
             for component_id, hops in distance.items():
-                path_ids = [component_id]
-                while distance[path_ids[-1]] > 0:
-                    current = path_ids[-1]
-                    candidates = [
-                        nxt
-                        for nxt in forward.get(current, ())
-                        if distance.get(nxt) == distance[current] - 1
-                    ]
-                    path_ids.append(
-                        min(
-                            candidates,
-                            key=lambda nxt: (
-                                components[nxt]["ecosystem"],
-                                components[nxt]["name"],
-                                components[nxt]["version"],
-                            ),
-                        )
-                    )
+                path_ids = self._shortest_path(
+                    component_id, distance, forward, components
+                )
                 records.append(
                     {
                         "component": dict(components[component_id]),
                         "vulnerability": str(observation["id"]),
                         "matched_name": matched_name,
                         "severity": str(observation["severity"]),
+                        "direct": hops == 0,
+                        "path": [dict(components[node]) for node in path_ids],
+                    }
+                )
+
+        # Imported OSV records: per (source, vulnerability, normalized package)
+        # a component appears at most once, carrying the terminal version
+        # condition and the severity basis.
+        for source, vid, severity, defaulted, norm_name, seeds, conditions in (
+            self._osv_hit_groups(components)
+        ):
+            distance = self._propagate(seeds, reverse)
+            for component_id, hops in distance.items():
+                path_ids = self._shortest_path(
+                    component_id, distance, forward, components
+                )
+                terminal = path_ids[-1]
+                records.append(
+                    {
+                        "component": dict(components[component_id]),
+                        "vulnerability": vid,
+                        "source": source,
+                        "matched_name": components[terminal]["name"],
+                        "matched_package": norm_name,
+                        "version_condition": conditions[terminal],
+                        "severity": severity,
+                        "severity_defaulted": defaulted,
+                        "severity_basis": (
+                            "缺失 database_specific.severity，默认定为 medium"
+                            if defaulted
+                            else "database_specific.severity"
+                        ),
                         "direct": hops == 0,
                         "path": [dict(components[node]) for node in path_ids],
                     }
@@ -739,7 +1586,9 @@ class Catalog:
                 record["component"]["name"],
                 record["component"]["version"],
                 record["vulnerability"],
+                record.get("source") or "",
                 record["matched_name"],
+                record.get("version_condition") or "",
             )
         )
         return records
