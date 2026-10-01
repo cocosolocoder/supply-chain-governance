@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from collections.abc import Sequence
 
 from .catalog import Catalog
@@ -20,6 +22,21 @@ def parser() -> argparse.ArgumentParser:
     vulnerability.add_argument("identifier")
     vulnerability.add_argument("component")
     vulnerability.add_argument("severity")
+    for action in ("add-dependency", "remove-dependency"):
+        dependency = subcommands.add_parser(action)
+        dependency.add_argument("service")
+        dependency.add_argument("ecosystem")
+        dependency.add_argument("name")
+        dependency.add_argument("version")
+        dependency.add_argument("dependency_service")
+        dependency.add_argument("dependency_ecosystem")
+        dependency.add_argument("dependency_name")
+        dependency.add_argument("dependency_version")
+    impact = subcommands.add_parser("impact")
+    impact.add_argument("--service")
+    impact.add_argument("--ecosystem")
+    impact.add_argument("--name")
+    impact.add_argument("--version")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
     return command
@@ -40,32 +57,71 @@ def render_summary(catalog: Catalog) -> str:
     )
 
 
+def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
+    if arguments.command == "init":
+        print("catalog initialized")
+    elif arguments.command == "add-component":
+        catalog.add_component(
+            arguments.service, arguments.ecosystem, arguments.name, arguments.version
+        )
+        print("component recorded")
+    elif arguments.command == "add-vulnerability":
+        catalog.add_vulnerability(
+            arguments.identifier, arguments.component, arguments.severity
+        )
+        print("vulnerability recorded")
+    elif arguments.command == "add-dependency":
+        catalog.add_dependency(
+            arguments.service,
+            arguments.ecosystem,
+            arguments.name,
+            arguments.version,
+            arguments.dependency_service,
+            arguments.dependency_ecosystem,
+            arguments.dependency_name,
+            arguments.dependency_version,
+        )
+        print("dependency recorded")
+    elif arguments.command == "remove-dependency":
+        catalog.remove_dependency(
+            arguments.service,
+            arguments.ecosystem,
+            arguments.name,
+            arguments.version,
+            arguments.dependency_service,
+            arguments.dependency_ecosystem,
+            arguments.dependency_name,
+            arguments.dependency_version,
+        )
+        print("dependency removed")
+    elif arguments.command == "impact":
+        records = catalog.impact(
+            service=arguments.service,
+            ecosystem=arguments.ecosystem,
+            name=arguments.name,
+            version=arguments.version,
+        )
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+    elif arguments.command == "summary":
+        print(render_summary(catalog))
+    elif arguments.command == "demo":
+        catalog.add_component("checkout-api", "pypi", "fastapi", "0.115.0")
+        catalog.add_component("worker", "pypi", "urllib3", "2.2.2")
+        catalog.add_component("portal", "npm", "react", "18.3.1")
+        catalog.add_vulnerability("CVE-2026-1000", "urllib3", "high")
+        catalog.add_vulnerability("CVE-2026-1001", "fastapi", "medium")
+        print(render_summary(catalog))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     catalog = Catalog(arguments.database)
     try:
-        if arguments.command == "init":
-            print("catalog initialized")
-        elif arguments.command == "add-component":
-            catalog.add_component(
-                arguments.service, arguments.ecosystem, arguments.name, arguments.version
-            )
-            print("component recorded")
-        elif arguments.command == "add-vulnerability":
-            catalog.add_vulnerability(
-                arguments.identifier, arguments.component, arguments.severity
-            )
-            print("vulnerability recorded")
-        elif arguments.command == "summary":
-            print(render_summary(catalog))
-        elif arguments.command == "demo":
-            catalog.add_component("checkout-api", "pypi", "fastapi", "0.115.0")
-            catalog.add_component("worker", "pypi", "urllib3", "2.2.2")
-            catalog.add_component("portal", "npm", "react", "18.3.1")
-            catalog.add_vulnerability("CVE-2026-1000", "urllib3", "high")
-            catalog.add_vulnerability("CVE-2026-1001", "fastapi", "medium")
-            print(render_summary(catalog))
+        run(arguments, catalog)
         return 0
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     finally:
         catalog.close()
 
