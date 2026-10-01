@@ -5,7 +5,7 @@ import json
 import sys
 from collections.abc import Sequence
 
-from .catalog import Catalog
+from .catalog import Catalog, ManifestError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -37,6 +37,14 @@ def parser() -> argparse.ArgumentParser:
     impact.add_argument("--ecosystem")
     impact.add_argument("--name")
     impact.add_argument("--version")
+    import_sbom = subcommands.add_parser(
+        "import-sbom",
+        aliases=("import-cyclonedx", "import-bom"),
+        help="import a CycloneDX 1.5 JSON manifest for one service and source",
+    )
+    import_sbom.add_argument("service")
+    import_sbom.add_argument("source")
+    import_sbom.add_argument("file")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
     return command
@@ -94,6 +102,16 @@ def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
             arguments.dependency_version,
         )
         print("dependency removed")
+    elif arguments.command in ("import-sbom", "import-cyclonedx", "import-bom"):
+        result = catalog.import_cyclonedx(
+            arguments.service, arguments.source, arguments.file
+        )
+        print(f"来源: {result.service}/{result.source}")
+        print(f"清单组件数: {result.source_components}")
+        print(f"新增组件: {result.components_added}")
+        print(f"删除组件: {result.components_deleted}")
+        print(f"新增依赖: {result.dependencies_added}")
+        print(f"删除依赖: {result.dependencies_deleted}")
     elif arguments.command == "impact":
         records = catalog.impact(
             service=arguments.service,
