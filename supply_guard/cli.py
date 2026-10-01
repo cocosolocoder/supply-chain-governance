@@ -41,6 +41,9 @@ def parser() -> argparse.ArgumentParser:
     sbom.add_argument("service")
     sbom.add_argument("source")
     sbom.add_argument("file")
+    osv = subcommands.add_parser("import-osv")
+    osv.add_argument("source")
+    osv.add_argument("file")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
     return command
@@ -115,6 +118,9 @@ def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
         print(f"删除组件: {result.deleted_components}")
         print(f"新增关系: {result.added_dependencies}")
         print(f"删除关系: {result.deleted_dependencies}")
+    elif arguments.command == "import-osv":
+        count = catalog.import_osv_file(arguments.source, arguments.file)
+        print(f"导入漏洞记录: {count} 条")
     elif arguments.command == "summary":
         print(render_summary(catalog))
     elif arguments.command == "demo":
