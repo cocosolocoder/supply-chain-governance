@@ -5,7 +5,7 @@ import re
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -62,9 +62,71 @@ CREATE TABLE IF NOT EXISTS osv_vulnerabilities (
     conditions TEXT NOT NULL,
     PRIMARY KEY(source, id, package_name)
 );
+CREATE TABLE IF NOT EXISTS exemptions (
+    id INTEGER PRIMARY KEY,
+    application_no TEXT NOT NULL UNIQUE,
+    service TEXT NOT NULL,
+    ecosystem TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    vulnerability_id TEXT NOT NULL,
+    matched_name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    applicant TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
+    risk_level TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exemptions_scope
+    ON exemptions(service, ecosystem, name, version,
+                  vulnerability_id, matched_name, source);
+CREATE TABLE IF NOT EXISTS exemption_history (
+    id INTEGER PRIMARY KEY,
+    application_no TEXT NOT NULL,
+    action TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    acted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exemption_history_no
+    ON exemption_history(application_no);
 """
 
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+EXEMPTION_STATUSES = ("pending", "approved", "rejected", "revoked")
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_timestamp(value: object, context: str) -> datetime:
+    """Parse a timezone-aware timestamp, returning it normalized to UTC."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} 必须为非空字符串")
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError as error:
+        raise ValueError(f"{context} 时间戳无效: {value!r}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{context} 必须包含时区")
+    return parsed.astimezone(timezone.utc)
+
+
+def _nonempty(value: object, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{context} 不能为空")
+    return value.strip()
 
 SUPPORTED_ECOSYSTEMS = ("pypi", "npm")
 
@@ -1225,3 +1287,444 @@ class Catalog:
             )
         )
         return records
+
+    # ------------------------------------------------------------------
+    # Exemption applications
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _exemption_dict(row: sqlite3.Row) -> dict:
+        return {
+            "application_no": str(row["application_no"]),
+            "service": str(row["service"]),
+            "ecosystem": str(row["ecosystem"]),
+            "name": str(row["name"]),
+            "version": str(row["version"]),
+            "vulnerability_id": str(row["vulnerability_id"]),
+            "matched_name": str(row["matched_name"]),
+            "source": str(row["source"]),
+            "applicant": str(row["applicant"]),
+            "reason": str(row["reason"]),
+            "expires_at": str(row["expires_at"]),
+            "status": str(row["status"]),
+            "risk_level": row["risk_level"],
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _history_dict(row: sqlite3.Row) -> dict:
+        return {
+            "application_no": str(row["application_no"]),
+            "action": str(row["action"]),
+            "operator": str(row["operator"]),
+            "reason": str(row["reason"]),
+            "from_status": str(row["from_status"]),
+            "to_status": str(row["to_status"]),
+            "acted_at": str(row["acted_at"]),
+        }
+
+    def _find_impact_record(
+        self,
+        service: str,
+        ecosystem: str,
+        name: str,
+        version: str,
+        vulnerability_id: str,
+        matched_name: str,
+        source: str,
+    ) -> dict | None:
+        """Find the current impact record matching an exemption scope.
+
+        Returns the impact record (which carries the current severity) or
+        None when the impact no longer exists.
+        """
+        for record in self.impact():
+            if (
+                record["component"]["service"] == service
+                and record["component"]["ecosystem"] == ecosystem
+                and record["component"]["name"] == name
+                and record["component"]["version"] == version
+                and record["vulnerability"] == vulnerability_id
+                and record["matched_name"] == matched_name
+                and (record["source"] or "") == source
+            ):
+                return record
+        return None
+
+    def _insert_history(
+        self,
+        application_no: str,
+        action: str,
+        operator: str,
+        reason: str,
+        from_status: str,
+        to_status: str,
+        acted_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO exemption_history(
+                application_no, action, operator, reason,
+                from_status, to_status, acted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (application_no, action, operator, reason, from_status, to_status, acted_at),
+        )
+
+    def apply_exemption(
+        self,
+        application_no: str,
+        service: str,
+        ecosystem: str,
+        name: str,
+        version: str,
+        vulnerability_id: str,
+        matched_name: str,
+        source: str | None,
+        applicant: str,
+        reason: str,
+        expires_at: str,
+    ) -> dict:
+        """Apply for an exemption on one current impact record.
+
+        The scope is limited to this single impact record: other versions,
+        services and sources require separate applications. Repeating the
+        same number with identical content returns the original application;
+        the same number with different content is an error. Only one
+        unexpired pending or approved application is allowed per scope.
+        """
+        service = _nonempty(service, "service")
+        ecosystem = _nonempty(ecosystem, "ecosystem")
+        name = _nonempty(name, "name")
+        version = _nonempty(version, "version")
+        vulnerability_id = _nonempty(vulnerability_id, "vulnerability_id")
+        matched_name = _nonempty(matched_name, "matched_name")
+        source = "" if source is None else source.strip()
+        applicant = _nonempty(applicant, "applicant")
+        reason = _nonempty(reason, "reason")
+        application_no = _nonempty(application_no, "application_no")
+        expiry = _parse_timestamp(expires_at, "expires_at")
+        now = _now_utc()
+        if expiry <= now:
+            raise ValueError("到期时间必须晚于提交时刻")
+        now_iso = _format_utc(now)
+        expires_iso = _format_utc(expiry)
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            existing = self.connection.execute(
+                "SELECT * FROM exemptions WHERE application_no = ?",
+                (application_no,),
+            ).fetchone()
+            if existing is not None:
+                if all(
+                    existing[column] == value
+                    for column, value in (
+                        ("service", service),
+                        ("ecosystem", ecosystem),
+                        ("name", name),
+                        ("version", version),
+                        ("vulnerability_id", vulnerability_id),
+                        ("matched_name", matched_name),
+                        ("source", source),
+                        ("applicant", applicant),
+                        ("reason", reason),
+                        ("expires_at", expires_iso),
+                    )
+                ):
+                    self.connection.execute("COMMIT")
+                    return self._exemption_dict(existing)
+                raise ValueError("申请编号已存在但内容不同")
+
+            scope_row = self.connection.execute(
+                """
+                SELECT application_no, status, expires_at FROM exemptions
+                WHERE service = ? AND ecosystem = ? AND name = ? AND version = ?
+                  AND vulnerability_id = ? AND matched_name = ? AND source = ?
+                  AND status IN ('pending', 'approved')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (service, ecosystem, name, version,
+                 vulnerability_id, matched_name, source),
+            ).fetchone()
+            if scope_row is not None:
+                scope_expiry = _parse_timestamp(
+                    scope_row["expires_at"], "expires_at"
+                )
+                if scope_expiry > now:
+                    raise ValueError(
+                        f"同一范围已存在未到期的{scope_row['status']}申请: "
+                        f"{scope_row['application_no']}"
+                    )
+
+            if self._find_impact_record(
+                service, ecosystem, name, version,
+                vulnerability_id, matched_name, source,
+            ) is None:
+                raise ValueError("目标影响记录不存在")
+
+            cursor = self.connection.execute(
+                """
+                INSERT INTO exemptions(
+                    application_no, service, ecosystem, name, version,
+                    vulnerability_id, matched_name, source, applicant, reason,
+                    expires_at, status, risk_level, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+                """,
+                (application_no, service, ecosystem, name, version,
+                 vulnerability_id, matched_name, source, applicant, reason,
+                 expires_iso, now_iso, now_iso),
+            )
+            self._insert_history(
+                application_no, "applied", applicant, reason,
+                "", "pending", now_iso,
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.rollback()
+            raise
+        row = self.connection.execute(
+            "SELECT * FROM exemptions WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return self._exemption_dict(row)
+
+    def _transition_exemption(
+        self,
+        application_no: str,
+        action: str,
+        operator: str,
+        reason: str,
+        from_status: str,
+        to_status: str,
+        extra_checks,
+    ) -> dict:
+        """Perform a state transition with concurrency protection.
+
+        The conditional UPDATE ... WHERE status = ? ensures that two
+        concurrent processes cannot both accept the same transition.
+        """
+        application_no = _nonempty(application_no, "application_no")
+        operator = _nonempty(operator, "operator")
+        reason = _nonempty(reason, "reason")
+        now_iso = _format_utc(_now_utc())
+
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            row = self.connection.execute(
+                "SELECT * FROM exemptions WHERE application_no = ?",
+                (application_no,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"申请不存在: {application_no}")
+            if str(row["status"]) != from_status:
+                raise ValueError(
+                    f"申请状态为 {row['status']}，无法执行{action}"
+                )
+            extra_checks(row)
+            cursor = self.connection.execute(
+                "UPDATE exemptions SET status = ?, updated_at = ? "
+                "WHERE application_no = ? AND status = ?",
+                (to_status, now_iso, application_no, from_status),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("申请已被其他进程处理")
+            self._insert_history(
+                application_no, action, operator, reason,
+                from_status, to_status, now_iso,
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self._exemption_dict(
+            self.connection.execute(
+                "SELECT * FROM exemptions WHERE application_no = ?",
+                (application_no,),
+            ).fetchone()
+        )
+
+    def approve_exemption(
+        self, application_no: str, operator: str, reason: str
+    ) -> dict:
+        """Approve a pending exemption.
+
+        The target impact must still exist, the applicant cannot approve
+        their own application, and the application must not be expired.
+        The current risk level is saved; later levels above it stop the
+        exemption from applying.
+        """
+        def checks(row: sqlite3.Row) -> None:
+            if operator == str(row["applicant"]):
+                raise ValueError("申请人不能批准自己的申请")
+            expiry = _parse_timestamp(row["expires_at"], "expires_at")
+            if expiry <= _now_utc():
+                raise ValueError("申请已到期，无法批准")
+            record = self._find_impact_record(
+                str(row["service"]), str(row["ecosystem"]), str(row["name"]),
+                str(row["version"]), str(row["vulnerability_id"]),
+                str(row["matched_name"]), str(row["source"]),
+            )
+            if record is None:
+                raise ValueError("目标影响记录不存在，无法批准")
+            self.connection.execute(
+                "UPDATE exemptions SET risk_level = ? WHERE application_no = ?",
+                (record["severity"], application_no),
+            )
+
+        return self._transition_exemption(
+            application_no, "approved", operator, reason,
+            "pending", "approved", checks,
+        )
+
+    def reject_exemption(
+        self, application_no: str, operator: str, reason: str
+    ) -> dict:
+        """Reject a pending exemption."""
+        return self._transition_exemption(
+            application_no, "rejected", operator, reason,
+            "pending", "rejected", lambda row: None,
+        )
+
+    def revoke_exemption(
+        self, application_no: str, operator: str, reason: str
+    ) -> dict:
+        """Revoke an approved, unexpired exemption."""
+        def checks(row: sqlite3.Row) -> None:
+            expiry = _parse_timestamp(row["expires_at"], "expires_at")
+            if expiry <= _now_utc():
+                raise ValueError("申请已到期，无法撤销")
+
+        return self._transition_exemption(
+            application_no, "revoked", operator, reason,
+            "approved", "revoked", checks,
+        )
+
+    def list_exemptions(
+        self, status: str | None = None, service: str | None = None
+    ) -> list[dict]:
+        """List exemption applications, optionally filtered by status/service."""
+        clauses: list[str] = []
+        values: list[str] = []
+        if status is not None:
+            status = status.strip().lower()
+            if status not in EXEMPTION_STATUSES:
+                raise ValueError(f"非法的申请状态: {status}")
+            clauses.append("status = ?")
+            values.append(status)
+        if service is not None:
+            service = service.strip()
+            if not service:
+                raise ValueError("service 不能为空")
+            clauses.append("service = ?")
+            values.append(service)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            f"SELECT * FROM exemptions{where} ORDER BY id", values
+        ).fetchall()
+        return [self._exemption_dict(row) for row in rows]
+
+    def exemption_history(self, application_no: str) -> list[dict]:
+        """Return the processing history of one application."""
+        application_no = _nonempty(application_no, "application_no")
+        rows = self.connection.execute(
+            "SELECT * FROM exemption_history WHERE application_no = ? ORDER BY id",
+            (application_no,),
+        ).fetchall()
+        return [self._history_dict(row) for row in rows]
+
+    def _exemption_for_impact(
+        self, record: dict, evaluation_at: datetime
+    ) -> tuple[bool, str | None, str | None]:
+        """Return (exempt, application_no, reason) for one impact record."""
+        source = record["source"] or ""
+        row = self.connection.execute(
+            """
+            SELECT * FROM exemptions
+            WHERE service = ? AND ecosystem = ? AND name = ? AND version = ?
+              AND vulnerability_id = ? AND matched_name = ? AND source = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (
+                record["component"]["service"],
+                record["component"]["ecosystem"],
+                record["component"]["name"],
+                record["component"]["version"],
+                record["vulnerability"],
+                record["matched_name"],
+                source,
+            ),
+        ).fetchone()
+        if row is None:
+            return False, None, "无豁免申请"
+        application_no = str(row["application_no"])
+        status = str(row["status"])
+        if status == "pending":
+            return False, application_no, "审批中"
+        if status == "rejected":
+            return False, application_no, "已拒绝"
+        if status == "revoked":
+            return False, application_no, "已撤销"
+        expiry = _parse_timestamp(row["expires_at"], "expires_at")
+        if expiry <= evaluation_at:
+            return False, application_no, "已过期"
+        risk_level = row["risk_level"]
+        if risk_level is not None and SEVERITY_RANK[record["severity"]] > SEVERITY_RANK[str(risk_level)]:
+            return False, application_no, "超出审批范围"
+        return True, application_no, None
+
+    def risk_report(
+        self, service: str | None = None, evaluation_at: str | None = None
+    ) -> dict:
+        """Generate a JSON report of current impacts and their exemption state.
+
+        Each impact record carries its source, severity, direct/indirect hit
+        and dependency path, plus whether it is exempt, the associated
+        application and the reason it is not effective. Times are compared
+        in UTC; an approved exemption stops applying from its expiry moment.
+        The evaluation moment only affects deadline judgment; catalog and
+        approval status both take current values.
+        """
+        if service is not None:
+            service = service.strip()
+            if not service:
+                raise ValueError("service 不能为空")
+        if evaluation_at is not None:
+            eval_at = _parse_timestamp(evaluation_at, "evaluation_at")
+        else:
+            eval_at = _now_utc()
+
+        impacts: list[dict] = []
+        unexempted_components: set[tuple[str, str, str, str]] = set()
+        highest: str | None = None
+        for record in self.impact(service=service):
+            exempt, application_no, reason = self._exemption_for_impact(
+                record, eval_at
+            )
+            entry = dict(record)
+            entry["exempt"] = exempt
+            entry["application_no"] = application_no
+            entry["reason"] = reason
+            impacts.append(entry)
+            if not exempt:
+                unexempted_components.add(
+                    (
+                        record["component"]["service"],
+                        record["component"]["ecosystem"],
+                        record["component"]["name"],
+                        record["component"]["version"],
+                    )
+                )
+                if highest is None or SEVERITY_RANK[record["severity"]] > SEVERITY_RANK[highest]:
+                    highest = record["severity"]
+
+        return {
+            "evaluation_at": _format_utc(eval_at),
+            "service": service,
+            "impacts": impacts,
+            "summary": {
+                "components": self.summary().components,
+                "unexempted_components": len(unexempted_components),
+                "highest_severity": highest,
+            },
+        }

@@ -46,6 +46,31 @@ def parser() -> argparse.ArgumentParser:
     osv.add_argument("file")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
+    apply_exemption = subcommands.add_parser("apply-exemption")
+    apply_exemption.add_argument("--application-no", required=True)
+    apply_exemption.add_argument("--service", required=True)
+    apply_exemption.add_argument("--ecosystem", required=True)
+    apply_exemption.add_argument("--name", required=True)
+    apply_exemption.add_argument("--version", required=True)
+    apply_exemption.add_argument("--vulnerability", required=True, dest="vulnerability_id")
+    apply_exemption.add_argument("--matched-name", required=True)
+    apply_exemption.add_argument("--source", default="")
+    apply_exemption.add_argument("--applicant", required=True)
+    apply_exemption.add_argument("--reason", required=True)
+    apply_exemption.add_argument("--expires-at", required=True)
+    for action in ("approve-exemption", "reject-exemption", "revoke-exemption"):
+        handler = subcommands.add_parser(action)
+        handler.add_argument("--application-no", required=True)
+        handler.add_argument("--operator", required=True)
+        handler.add_argument("--reason", required=True)
+    list_exemptions = subcommands.add_parser("list-exemptions")
+    list_exemptions.add_argument("--status")
+    list_exemptions.add_argument("--service")
+    exemption_history = subcommands.add_parser("exemption-history")
+    exemption_history.add_argument("--application-no", required=True)
+    risk_report = subcommands.add_parser("risk-report")
+    risk_report.add_argument("--service")
+    risk_report.add_argument("--at", dest="evaluation_at")
     return command
 
 
@@ -130,6 +155,49 @@ def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
         catalog.add_vulnerability("CVE-2026-1000", "urllib3", "high")
         catalog.add_vulnerability("CVE-2026-1001", "fastapi", "medium")
         print(render_summary(catalog))
+    elif arguments.command == "apply-exemption":
+        result = catalog.apply_exemption(
+            application_no=arguments.application_no,
+            service=arguments.service,
+            ecosystem=arguments.ecosystem,
+            name=arguments.name,
+            version=arguments.version,
+            vulnerability_id=arguments.vulnerability_id,
+            matched_name=arguments.matched_name,
+            source=arguments.source,
+            applicant=arguments.applicant,
+            reason=arguments.reason,
+            expires_at=arguments.expires_at,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "approve-exemption":
+        result = catalog.approve_exemption(
+            arguments.application_no, arguments.operator, arguments.reason
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "reject-exemption":
+        result = catalog.reject_exemption(
+            arguments.application_no, arguments.operator, arguments.reason
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "revoke-exemption":
+        result = catalog.revoke_exemption(
+            arguments.application_no, arguments.operator, arguments.reason
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "list-exemptions":
+        result = catalog.list_exemptions(
+            status=arguments.status, service=arguments.service
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "exemption-history":
+        result = catalog.exemption_history(arguments.application_no)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif arguments.command == "risk-report":
+        result = catalog.risk_report(
+            service=arguments.service, evaluation_at=arguments.evaluation_at
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
