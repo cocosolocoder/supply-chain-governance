@@ -37,6 +37,10 @@ def parser() -> argparse.ArgumentParser:
     impact.add_argument("--ecosystem")
     impact.add_argument("--name")
     impact.add_argument("--version")
+    sbom = subcommands.add_parser("import-sbom")
+    sbom.add_argument("service")
+    sbom.add_argument("source")
+    sbom.add_argument("file")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
     return command
@@ -102,6 +106,15 @@ def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
             version=arguments.version,
         )
         print(json.dumps(records, ensure_ascii=False, indent=2))
+    elif arguments.command == "import-sbom":
+        result = catalog.import_sbom_file(
+            arguments.service, arguments.source, arguments.file
+        )
+        print(f"来源组件数: {result.source_components}")
+        print(f"新增组件: {result.added_components}")
+        print(f"删除组件: {result.deleted_components}")
+        print(f"新增关系: {result.added_dependencies}")
+        print(f"删除关系: {result.deleted_dependencies}")
     elif arguments.command == "summary":
         print(render_summary(catalog))
     elif arguments.command == "demo":
