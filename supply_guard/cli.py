@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from collections.abc import Sequence
 
-from .catalog import Catalog
+from .catalog import Catalog, ImpactRecord
+
+
+def _identity_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("service")
+    parser.add_argument("ecosystem")
+    parser.add_argument("name")
+    parser.add_argument("version")
+    parser.add_argument("depends_on_service")
+    parser.add_argument("depends_on_ecosystem")
+    parser.add_argument("depends_on_name")
+    parser.add_argument("depends_on_version")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,7 +33,20 @@ def parser() -> argparse.ArgumentParser:
     vulnerability.add_argument("identifier")
     vulnerability.add_argument("component")
     vulnerability.add_argument("severity")
+    add_dependency = subcommands.add_parser(
+        "add-dependency", aliases=["add-dep"]
+    )
+    _identity_arguments(add_dependency)
+    delete_dependency = subcommands.add_parser(
+        "delete-dependency", aliases=["delete-dep"]
+    )
+    _identity_arguments(delete_dependency)
     subcommands.add_parser("summary")
+    impact = subcommands.add_parser("impact", aliases=["impact-details"])
+    impact.add_argument("--service")
+    impact.add_argument("--ecosystem")
+    impact.add_argument("--name")
+    impact.add_argument("--version")
     subcommands.add_parser("demo")
     return command
 
@@ -40,6 +66,32 @@ def render_summary(catalog: Catalog) -> str:
     )
 
 
+def render_impact(records: Sequence[ImpactRecord]) -> str:
+    payload = [
+        {
+            "service": record.component.service,
+            "ecosystem": record.component.ecosystem,
+            "name": record.component.name,
+            "version": record.component.version,
+            "vulnerability_id": record.vulnerability.identifier,
+            "vulnerability_name": record.vulnerability.component_name,
+            "severity": record.vulnerability.severity,
+            "direct": record.direct,
+            "path": [
+                {
+                    "service": node.service,
+                    "ecosystem": node.ecosystem,
+                    "name": node.name,
+                    "version": node.version,
+                }
+                for node in record.path
+            ],
+        }
+        for record in records
+    ]
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     catalog = Catalog(arguments.database)
@@ -56,16 +108,65 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.identifier, arguments.component, arguments.severity
             )
             print("vulnerability recorded")
+        elif arguments.command in ("add-dependency", "add-dep"):
+            catalog.add_dependency(
+                arguments.service,
+                arguments.ecosystem,
+                arguments.name,
+                arguments.version,
+                arguments.depends_on_service,
+                arguments.depends_on_ecosystem,
+                arguments.depends_on_name,
+                arguments.depends_on_version,
+            )
+            print("dependency recorded")
+        elif arguments.command in ("delete-dependency", "delete-dep"):
+            catalog.delete_dependency(
+                arguments.service,
+                arguments.ecosystem,
+                arguments.name,
+                arguments.version,
+                arguments.depends_on_service,
+                arguments.depends_on_ecosystem,
+                arguments.depends_on_name,
+                arguments.depends_on_version,
+            )
+            print("dependency removed")
         elif arguments.command == "summary":
             print(render_summary(catalog))
+        elif arguments.command in ("impact", "impact-details"):
+            print(
+                render_impact(
+                    catalog.impact(
+                        arguments.service,
+                        arguments.ecosystem,
+                        arguments.name,
+                        arguments.version,
+                    )
+                )
+            )
         elif arguments.command == "demo":
             catalog.add_component("checkout-api", "pypi", "fastapi", "0.115.0")
+            catalog.add_component("checkout-api", "pypi", "gunicorn", "21.2.0")
             catalog.add_component("worker", "pypi", "urllib3", "2.2.2")
             catalog.add_component("portal", "npm", "react", "18.3.1")
+            catalog.add_dependency(
+                "checkout-api",
+                "pypi",
+                "gunicorn",
+                "21.2.0",
+                "checkout-api",
+                "pypi",
+                "fastapi",
+                "0.115.0",
+            )
             catalog.add_vulnerability("CVE-2026-1000", "urllib3", "high")
             catalog.add_vulnerability("CVE-2026-1001", "fastapi", "medium")
             print(render_summary(catalog))
         return 0
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
     finally:
         catalog.close()
 
