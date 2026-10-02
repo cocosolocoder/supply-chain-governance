@@ -478,14 +478,23 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
 
 
 def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
-    """Validate a CycloneDX 1.5 SBOM and return (identities, edges).
+    """Validate an SBOM document and return (identities, edges).
 
-    identities is the set of (ecosystem, name, version) tuples registered
-    under the importing service. edges is a set of (dependent, dependency)
-    identity pairs. All validation happens before any database write.
+    Both CycloneDX 1.5 and SPDX 2.3 JSON are accepted; the format is
+    recognized from the document itself. identities is the set of
+    (ecosystem, name, version) tuples registered under the importing
+    service. edges is a set of (dependent, dependency) identity pairs.
+    All validation happens before any database write.
     """
     if not isinstance(sbom, dict):
         raise ValueError("清单必须是 JSON 对象")
+    if "spdxVersion" in sbom:
+        return _parse_spdx(sbom)
+    return _parse_cyclonedx(sbom)
+
+
+def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
+    """Validate a CycloneDX 1.5 SBOM and return (identities, edges)."""
     if sbom.get("bomFormat") != "CycloneDX":
         raise ValueError("bomFormat 必须为 CycloneDX")
     if sbom.get("specVersion") != "1.5":
@@ -579,6 +588,125 @@ def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tupl
                     f"合并后产生自依赖: {ref} -> {target}"
                 )
             edges.add((dependent_identity, dependency_identity))
+
+    return identity_set, edges
+
+
+def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, str]:
+    """Extract a component identity from a package's purl external refs."""
+    external_refs = package.get("externalRefs")
+    if external_refs is None:
+        raise ValueError(f"packages[{index}] (SPDXID {ref}) 缺少 purl 引用")
+    if not isinstance(external_refs, list) or not external_refs:
+        raise ValueError(f"packages[{index}] (SPDXID {ref}) externalRefs 必须为非空数组")
+    identity: tuple[str, str, str] | None = None
+    for ref_index, external_ref in enumerate(external_refs):
+        if not isinstance(external_ref, dict):
+            raise ValueError(
+                f"packages[{index}].externalRefs[{ref_index}] 必须为对象"
+            )
+        if external_ref.get("referenceType") != "purl":
+            continue
+        try:
+            candidate = parse_purl(external_ref.get("referenceLocator"))
+        except ValueError as error:
+            raise ValueError(
+                f"packages[{index}] (SPDXID {ref}) purl 无效: {error}"
+            ) from error
+        if identity is None:
+            identity = candidate
+        elif candidate != identity:
+            raise ValueError(
+                f"packages[{index}] (SPDXID {ref}) 多个 purl 指向不同组件身份"
+            )
+    if identity is None:
+        raise ValueError(f"packages[{index}] (SPDXID {ref}) 缺少 purl 引用")
+    return identity
+
+
+def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
+    """Validate an SPDX 2.3 JSON document and return (identities, edges)."""
+    if document.get("spdxVersion") != "SPDX-2.3":
+        raise ValueError("spdxVersion 必须为 SPDX-2.3")
+    document_spdxid = document.get("SPDXID")
+    if not isinstance(document_spdxid, str) or not document_spdxid:
+        raise ValueError("文档 SPDXID 必须为非空字符串")
+    if "packages" not in document:
+        raise ValueError("缺少 packages 字段")
+    packages = document["packages"]
+    if not isinstance(packages, list):
+        raise ValueError("packages 必须为数组")
+
+    identities: dict[str, tuple[str, str, str]] = {}
+    identity_set: set[tuple[str, str, str]] = set()
+    for index, package in enumerate(packages):
+        if not isinstance(package, dict):
+            raise ValueError(f"packages[{index}] 必须为对象")
+        spdxid = package.get("SPDXID")
+        if not isinstance(spdxid, str) or not spdxid:
+            raise ValueError(f"packages[{index}] SPDXID 必须为非空字符串")
+        if spdxid == document_spdxid:
+            raise ValueError(f"packages[{index}] SPDXID 与文档标识冲突: {spdxid}")
+        if spdxid in identities:
+            raise ValueError(f"SPDXID 重复: {spdxid}")
+        identity = _spdx_purl_identity(package, index, spdxid)
+        if "versionInfo" in package:
+            version_info = package["versionInfo"]
+            if not isinstance(version_info, str) or not version_info:
+                raise ValueError(
+                    f"packages[{index}] (SPDXID {spdxid}) versionInfo 必须为非空字符串"
+                )
+            if version_info != identity[2]:
+                raise ValueError(
+                    f"packages[{index}] (SPDXID {spdxid}) versionInfo 与 purl 版本不一致"
+                )
+        identities[spdxid] = identity
+        identity_set.add(identity)
+
+    edges: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
+    if "relationships" in document:
+        relationships = document["relationships"]
+        if not isinstance(relationships, list):
+            raise ValueError("relationships 必须为数组")
+    else:
+        relationships = []
+    for index, relationship in enumerate(relationships):
+        if not isinstance(relationship, dict):
+            raise ValueError(f"relationships[{index}] 必须为对象")
+        relationship_type = relationship.get("relationshipType")
+        if relationship_type == "DEPENDS_ON":
+            source_key, target_key = "spdxElementId", "relatedSpdxElement"
+        elif relationship_type == "DEPENDENCY_OF":
+            source_key, target_key = "relatedSpdxElement", "spdxElementId"
+        else:
+            # DESCRIBES and every other non-dependency relation are ignored;
+            # the document itself is never a component.
+            continue
+        source = relationship.get(source_key)
+        target = relationship.get(target_key)
+        if not isinstance(source, str) or not source:
+            raise ValueError(
+                f"relationships[{index}].{source_key} 必须为非空字符串"
+            )
+        if not isinstance(target, str) or not target:
+            raise ValueError(
+                f"relationships[{index}].{target_key} 必须为非空字符串"
+            )
+        if source == document_spdxid or target == document_spdxid:
+            raise ValueError(
+                f"relationships[{index}] 引用了文档标识而非包: {source} -> {target}"
+            )
+        if source not in identities:
+            raise ValueError(f"relationships[{index}] 引用未知标识: {source}")
+        if target not in identities:
+            raise ValueError(f"relationships[{index}] 引用未知标识: {target}")
+        dependent_identity = identities[source]
+        dependency_identity = identities[target]
+        if dependent_identity == dependency_identity:
+            raise ValueError(
+                f"合并后产生自依赖: {source} -> {target}"
+            )
+        edges.add((dependent_identity, dependency_identity))
 
     return identity_set, edges
 
@@ -786,7 +914,10 @@ class Catalog:
     def import_sbom(
         self, service: str, source_name: str, sbom: object
     ) -> ImportResult:
-        """Register the components and dependencies of a CycloneDX 1.5 SBOM.
+        """Register the components and dependencies of an SBOM document.
+
+        Both CycloneDX 1.5 and SPDX 2.3 JSON are accepted; the format is
+        detected automatically.
 
         The source (service, source_name) is replaced: its previous components
         and relationships lose ownership, and components/relationships no
@@ -930,7 +1061,7 @@ class Catalog:
     def import_sbom_file(
         self, service: str, source_name: str, path: str | Path
     ) -> ImportResult:
-        """Read a CycloneDX 1.5 JSON file and import it."""
+        """Read a CycloneDX 1.5 or SPDX 2.3 JSON file and import it."""
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 sbom = json.load(handle)

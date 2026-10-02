@@ -51,6 +51,55 @@ Each impact record carries the affected component identity, the vulnerability
 id and matched name, the severity, whether the hit is direct, and the
 shortest dependency path from the component to a directly hit component.
 
+## SBOM imports (CycloneDX and SPDX)
+
+`import-sbom` takes a service, a source name and a JSON file. The format is
+recognized automatically: CycloneDX 1.5 (`bomFormat`/`specVersion`) and
+SPDX 2.3 (`spdxVersion: SPDX-2.3`) are both accepted, including through the
+Python `Catalog.import_sbom` / `import_sbom_file` entry points.
+
+```bash
+python3 -m supply_guard.cli --database catalog.db import-sbom api src ./api.spdx.json
+```
+
+SPDX rules:
+
+- `spdxVersion` must be `SPDX-2.3`, `packages` must be an array (an empty
+  array clears the source declaration), and the document and every package
+  must carry a unique, non-empty `SPDXID`; a package id must not repeat and
+  must not equal the document id.
+- each package gets its component identity from the `externalRefs` entry
+  whose `referenceType` is `purl`; only versioned PyPI and npm packages are
+  supported, npm scopes and percent-decoding behave exactly as for
+  CycloneDX. A missing/unparseable/unsupported purl, or several purls that
+  resolve to different identities, rejects the import; repeated purls for
+  the same identity merge. `versionInfo`, when present, must equal the purl
+  version; the display `name` never participates in identity matching.
+- relationships use `A DEPENDS_ON B` (A depends on B) and
+  `A DEPENDENCY_OF B` (B depends on A); equivalent statements register once.
+  Both ends must reference packages in this document — unknown ids, external
+  document references and self-dependencies produced by merging are
+  rejected, while cycles between distinct packages are allowed. `DESCRIBES`
+  and other non-dependency relationship types are ignored, the document
+  itself is not a component, and a missing `relationships` key counts as an
+  empty array (a present one must be an array).
+- packages that share an identity are merged and all relationships are
+  interpreted against the merged components, so package/relationship order
+  never changes the result.
+
+Re-importing the same service and source replaces the previous declaration,
+including when the source switches between CycloneDX and SPDX; two lists are
+never accumulated. Other sources, manually registered components and
+dependencies (and the endpoints manual dependencies need) are preserved.
+The success output is the same import statistics for both formats, counted
+over the merged components and relationships, so importing identical
+content again adds or removes nothing. Summaries, impact paths and the risk
+report reflect the new list immediately; existing exemptions and their
+history remain and continue to apply against current impact. File, JSON or
+validation failures return a non-zero status naming the offending object
+and leave the previous source declaration and all other business data
+unchanged.
+
 ## Local vulnerability exemptions
 
 A user can request an exemption for **one specific impact record**, another
