@@ -46,6 +46,62 @@ def parser() -> argparse.ArgumentParser:
     osv.add_argument("file")
     subcommands.add_parser("summary")
     subcommands.add_parser("demo")
+
+    request = subcommands.add_parser("request-exemption")
+    request.add_argument("id")
+    request.add_argument("service")
+    request.add_argument("ecosystem")
+    request.add_argument("name")
+    request.add_argument("version")
+    request.add_argument("vulnerability")
+    request.add_argument("matched_name")
+    request.add_argument(
+        "source",
+        nargs="?",
+        default=None,
+        help="OSV 来源名称；省略表示手工登记的漏洞",
+    )
+    request.add_argument("--applicant", required=True)
+    request.add_argument("--reason", required=True)
+    request.add_argument(
+        "--expires-at",
+        required=True,
+        help="带时区的到期时间，例如 2026-12-31T23:59:59+08:00",
+    )
+
+    approve = subcommands.add_parser("approve-exemption")
+    approve.add_argument("id")
+    approve.add_argument("--handler", required=True)
+    approve.add_argument("--note", required=True)
+
+    reject = subcommands.add_parser("reject-exemption")
+    reject.add_argument("id")
+    reject.add_argument("--handler", required=True)
+    reject.add_argument("--note", required=True)
+
+    revoke = subcommands.add_parser("revoke-exemption")
+    revoke.add_argument("id")
+    revoke.add_argument("--handler", required=True)
+    revoke.add_argument("--note", required=True)
+
+    show = subcommands.add_parser("exemption-show")
+    show.add_argument("id")
+
+    exemptions = subcommands.add_parser("exemption-list")
+    exemptions.add_argument(
+        "--status",
+        choices=["pending", "approved", "rejected", "revoked"],
+        default=None,
+    )
+
+    report = subcommands.add_parser("risk-report")
+    report.add_argument("--service")
+    report.add_argument(
+        "--at",
+        dest="evaluated_at",
+        default=None,
+        help="带时区的评估时刻，仅用于判断豁免期限；省略时取当前时间",
+    )
     return command
 
 
@@ -123,6 +179,61 @@ def run(arguments: argparse.Namespace, catalog: Catalog) -> None:
         print(f"导入漏洞记录: {count} 条")
     elif arguments.command == "summary":
         print(render_summary(catalog))
+    elif arguments.command == "request-exemption":
+        record = catalog.request_exemption(
+            arguments.id,
+            arguments.service,
+            arguments.ecosystem,
+            arguments.name,
+            arguments.version,
+            arguments.vulnerability,
+            arguments.matched_name,
+            arguments.source,
+            arguments.applicant,
+            arguments.reason,
+            arguments.expires_at,
+        )
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+    elif arguments.command == "approve-exemption":
+        record = catalog.approve_exemption(
+            arguments.id, arguments.handler, arguments.note
+        )
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+    elif arguments.command == "reject-exemption":
+        record = catalog.reject_exemption(
+            arguments.id, arguments.handler, arguments.note
+        )
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+    elif arguments.command == "revoke-exemption":
+        record = catalog.revoke_exemption(
+            arguments.id, arguments.handler, arguments.note
+        )
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+    elif arguments.command == "exemption-show":
+        print(
+            json.dumps(
+                catalog.get_exemption(arguments.id), ensure_ascii=False, indent=2
+            )
+        )
+    elif arguments.command == "exemption-list":
+        print(
+            json.dumps(
+                catalog.list_exemptions(status=arguments.status),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif arguments.command == "risk-report":
+        print(
+            json.dumps(
+                catalog.risk_report(
+                    service=arguments.service,
+                    evaluated_at=arguments.evaluated_at,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif arguments.command == "demo":
         catalog.add_component("checkout-api", "pypi", "fastapi", "0.115.0")
         catalog.add_component("worker", "pypi", "urllib3", "2.2.2")
