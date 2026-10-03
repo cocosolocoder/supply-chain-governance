@@ -150,6 +150,19 @@ components each need their own request, and exempting a directly hit library
 does **not** exempt components that depend on it. The request is refused if
 the target impact record does not currently exist.
 
+Both the submission existence check and the approval re-check evaluate the
+target **service only**, exactly like a `--service`-scoped report: an
+unparseable component version in another service (even for the same package
+name) never blocks requesting or approving this service's exemption, while
+the service's own complete dependency graph is still considered, so an
+upstream component reached only through dependencies counts as affected. A
+component within the target service whose version has to be compared with an
+OSV record but cannot be parsed still fails the request or approval, naming
+the component's full identity; it is never skipped to claim the impact does
+or does not exist. If the target impact is gone at approval time the
+approval fails and the request stays pending with its history intact.
+Directory-wide queries keep the existing version-error behavior.
+
 ```bash
 # Manual vulnerability (no trailing source)
 python3 -m supply_guard.cli --database catalog.db request-exemption \

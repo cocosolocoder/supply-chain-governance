@@ -1604,8 +1604,17 @@ class Catalog:
         matched_name: str,
         source: str | None,
     ) -> bool:
-        """Whether the exact scope currently names a live impact record."""
-        for record in self._impact_records():
+        """Whether the exact scope currently names a live impact record.
+
+        Matching runs only inside the target service: a component with an
+        unparseable version in another service must neither fail the
+        existence check nor be mistaken for the target. The service's full
+        dependency graph still participates, so an upstream component counts
+        as affected through its dependencies, not only on a direct hit. A
+        version that has to be compared with an OSV record inside this
+        service remains a query error (raised by the graph builder).
+        """
+        for record in self._impact_records(service):
             component = record["component"]
             if (
                 component["service"] == service
@@ -2043,8 +2052,15 @@ class Catalog:
         return self._fetch_request(request_id)
 
     def _current_scope_severity(self, scope: tuple) -> str | None:
-        """Severity of the live impact record exactly matching ``scope``."""
-        for record in self._impact_records():
+        """Severity of the live impact record exactly matching ``scope``.
+
+        Re-confirmation is confined to the scope's own service, so a bad
+        version newly added to another service cannot block an approval; a
+        component within the service that still needs an OSV version
+        comparison stays an error. Returns None only when the service graph
+        builds cleanly but the target impact itself no longer exists.
+        """
+        for record in self._impact_records(scope[0]):
             component = record["component"]
             if (
                 component["service"] == scope[0]

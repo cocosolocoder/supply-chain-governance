@@ -412,6 +412,151 @@ class RequestValidationTests(ExemptionFixture):
         self.assertFalse(by[("api", "app", "CVE-MAN", None)]["exempted"])
 
 
+class ServiceScopedValidationTests(ExemptionFixture):
+    """Other services' unparseable versions must not block this service.
+
+    worker's same-named ``lib`` gets a version PEP 440 cannot parse; the
+    imported CVE-OSV record matches the normalized package name, so every
+    directory-wide impact computation has to compare it and fails. Exemption
+    submission and approval for api must still succeed, while anything that
+    genuinely needs a comparison inside api remains a hard error.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.catalog.add_component("worker", "pypi", "lib", "not-a-version")
+
+    def assert_directory_wide_queries_still_fail(self) -> None:
+        # The directory-wide behavior is unchanged: the bad version is a
+        # query error for the whole catalog.
+        with self.assertRaises(ValueError):
+            self.catalog.impact()
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report()
+        with self.assertRaises(ValueError):
+            self.catalog.summary()
+
+    def test_request_manual_direct_hit_succeeds(self) -> None:
+        record = self.request()
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["scope"]["source"], None)
+        self.assertEqual(len(record["events"]), 1)
+        self.assert_directory_wide_queries_still_fail()
+
+    def test_request_osv_direct_hit_succeeds(self) -> None:
+        record = self.request(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd"
+        )
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["scope"]["source"], "nvd")
+
+    def test_request_for_transitive_upstream_uses_full_dependency_graph(self) -> None:
+        # app only exists because it depends, transitively, on lib: the
+        # service-scoped graph keeps the complete dependency chain.
+        for vulnerability, source in (
+            ("CVE-MAN", None),
+            ("CVE-OSV", "nvd"),
+        ):
+            with self.subTest(vulnerability=vulnerability):
+                record = self.request(
+                    f"REQ-{vulnerability}",
+                    name="app",
+                    vulnerability=vulnerability,
+                    matched_name="lib",
+                    source=source,
+                )
+                self.assertEqual(record["status"], "pending")
+                self.assertEqual(record["scope"]["name"], "app")
+
+    def test_request_for_missing_target_leaves_no_record(self) -> None:
+        with self.assertRaises(ValueError):
+            self.request(name="ghost")
+        with self.assertRaises(ValueError):
+            self.request(vulnerability="CVE-NOPE")
+        # A different OSV source is a scope that does not exist in api.
+        with self.assertRaises(ValueError):
+            self.request(source="other-source")
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_unparseable_version_inside_target_service_blocks_request(self) -> None:
+        # A second lib version inside api itself has to be compared with the
+        # imported OSV record: the request must fail and name the component's
+        # full identity, never silently skip it.
+        self.catalog.add_component("api", "pypi", "lib", "not-a-version")
+        with self.assertRaises(ValueError) as context:
+            self.request()
+        message = str(context.exception)
+        self.assertIn("api/pypi/lib/not-a-version", message)
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_unrelated_bad_version_inside_service_still_blocks(self) -> None:
+        # Even a different package: as long as an OSV record matches its name
+        # and the version cannot be compared, existence cannot be decided.
+        self.catalog.import_osv(
+            "other",
+            [osv_record("CVE-OTHER", package="brokenpkg", severity="low",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.add_component(
+            "api", "pypi", "brokenpkg", "not-a-version"
+        )
+        with self.assertRaises(ValueError) as context:
+            self.request()
+        self.assertIn("api/pypi/brokenpkg/not-a-version", str(context.exception))
+
+    def test_approve_succeeds_and_records_current_severity(self) -> None:
+        self.request()
+        record = self.catalog.approve_exemption("REQ-1", "bob", "ok")
+        self.assertEqual(record["status"], "approved")
+        self.assertEqual(record["approved_severity"], "high")
+        self.assertEqual(
+            [event["action"] for event in record["events"]],
+            ["request", "approve"],
+        )
+        # The OSV request records the OSV severity in force at approval.
+        self.request("REQ-OSV", vulnerability="CVE-OSV", source="nvd")
+        osv = self.catalog.approve_exemption("REQ-OSV", "carol", "ok")
+        self.assertEqual(osv["approved_severity"], "low")
+
+    def test_approve_failure_keeps_pending_state_and_history(self) -> None:
+        # The impact disappears after submission; the other service's bad
+        # version must neither mask the disappearance nor block the error.
+        self.request("REQ-OSV", vulnerability="CVE-OSV", source="nvd")
+        self.catalog.import_osv("nvd", [])
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-OSV", "bob", "gone")
+        record = self.catalog.get_exemption("REQ-OSV")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approved_severity"])
+        self.assertEqual(len(record["events"]), 1)
+
+    def test_bad_version_new_in_target_service_blocks_approval(self) -> None:
+        self.request()
+        self.catalog.add_component("api", "pypi", "lib", "not-a-version")
+        with self.assertRaises(ValueError) as context:
+            self.catalog.approve_exemption("REQ-1", "bob", "ok")
+        self.assertIn("api/pypi/lib/not-a-version", str(context.exception))
+        record = self.catalog.get_exemption("REQ-1")
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(len(record["events"]), 1)
+
+    def test_service_report_exemption_stays_scoped_with_bad_version(self) -> None:
+        self.request()
+        self.catalog.approve_exemption("REQ-1", "bob", "ok")
+        report = self.catalog.risk_report(service="api")
+        manual = next(
+            entry for entry in report["impacts"]
+            if entry["component"]["name"] == "lib"
+            and entry["vulnerability"] == "CVE-MAN"
+        )
+        self.assertTrue(manual["exempted"])
+        self.assertEqual(manual["exemption_request"], "REQ-1")
+        # worker's same-name component is untouched (its report cannot even
+        # build while its version is unparseable).
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report(service="worker")
+
+
 class DecisionTests(ExemptionFixture):
     def test_approve_records_severity_and_history(self) -> None:
         self.request()
@@ -967,6 +1112,68 @@ class CliTests(unittest.TestCase):
                 record["expires_at"], "2026-02-01T00:00:00.000000Z"
             )
             self.assertEqual(len(record["events"]), 1)
+            check.close()
+
+
+    def test_cli_exemption_not_blocked_by_other_service_bad_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            setup = Catalog(database)
+            setup.add_component("api", "pypi", "app", "1.0.0")
+            setup.add_component("api", "pypi", "lib", "1.0.0")
+            setup.add_dependency(
+                "api", "pypi", "app", "1.0.0",
+                "api", "pypi", "lib", "1.0.0",
+            )
+            setup.add_component("worker", "pypi", "lib", "not-a-version")
+            setup.import_osv(
+                "nvd",
+                [osv_record("CVE-OSV", package="lib", severity="low",
+                            versions=["1.0.0"])],
+            )
+            setup.close()
+
+            def run(*args):
+                return main(["--database", database, *args])
+
+            # The transitive impact on app can be requested through the CLI.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "app", "1.0.0", "CVE-OSV", "lib", "nvd",
+                    "--applicant", "alice", "--reason", "x",
+                    "--expires-at", "2030-01-01T00:00:00+00:00",
+                ),
+                0,
+            )
+            # worker's bad version does not block approval via the CLI.
+            self.assertEqual(
+                run("approve-exemption", "REQ-1",
+                    "--handler", "bob", "--note", "ok"),
+                0,
+            )
+            # A genuinely missing target still fails via the CLI and leaves
+            # no record.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-2",
+                    "api", "pypi", "ghost", "1.0.0", "CVE-OSV", "lib", "nvd",
+                    "--applicant", "alice", "--reason", "x",
+                    "--expires-at", "2030-01-01T00:00:00+00:00",
+                ),
+                1,
+            )
+            check = Catalog(database)
+            ids = [
+                row["id"]
+                for row in check.connection.execute(
+                    "SELECT id FROM exemption_requests ORDER BY id"
+                )
+            ]
+            self.assertEqual(ids, ["REQ-1"])
+            self.assertEqual(
+                check.get_exemption("REQ-1")["status"], "approved"
+            )
             check.close()
 
 
