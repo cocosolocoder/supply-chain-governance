@@ -519,6 +519,64 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     return ecosystem, name, version
 
 
+@dataclass
+class _SbomDocument:
+    """Format-independent view of one SBOM document.
+
+    Both CycloneDX and SPDX describe the same catalog content: a set of
+    document references (bom-ref / SPDXID), each bound to one component
+    identity, and a set of directed relationships between references. The
+    format-specific parsers only translate their document shape into this
+    model — including which references are roots, which relations denote a
+    dependency and how endpoints are named — while identity merging,
+    relationship deduplication and the merged self-dependency check live in
+    one place (:meth:`build`).
+
+    ``identities`` maps every registered reference to its component identity;
+    ``root_ref`` is a reference that names the document itself (CycloneDX
+    metadata component / SPDX document id); edges are raw
+    ``(dependent ref, dependency ref)`` pairs in document order.
+    """
+
+    identities: dict[str, tuple[str, str, str]]
+    edges: list[tuple[str, str]]
+    root_ref: str | None = None
+
+    def build(
+        self,
+    ) -> tuple[
+        set[tuple[str, str, str]],
+        set[tuple[tuple[str, str, str], tuple[str, str, str]]],
+    ]:
+        """Return (identities, edges) resolved against merged components.
+
+        Reference validity is checked separately by each format parser, so
+        every edge endpoint here is a registered reference and no edge points
+        at the document/root reference. Multiple references may share one
+        component identity: they register a single catalog component, while
+        the dependencies declared through every one of them are kept and
+        repointed at the merged component. Equal relationships are registered
+        once, cycles between distinct identities are allowed, and an edge
+        whose two references collapse onto one identity is a self-dependency
+        that must be rejected even though the original references differ.
+        Document order never affects the result because both containers are
+        sets.
+        """
+        identity_set = set(self.identities.values())
+        merged_edges: set[
+            tuple[tuple[str, str, str], tuple[str, str, str]]
+        ] = set()
+        for dependent_ref, dependency_ref in self.edges:
+            dependent_identity = self.identities[dependent_ref]
+            dependency_identity = self.identities[dependency_ref]
+            if dependent_identity == dependency_identity:
+                raise ValueError(
+                    f"合并后产生自依赖: {dependent_ref} -> {dependency_ref}"
+                )
+            merged_edges.add((dependent_identity, dependency_identity))
+        return identity_set, merged_edges
+
+
 def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
     """Validate an SBOM document and return (identities, edges).
 
@@ -531,12 +589,14 @@ def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tupl
     if not isinstance(sbom, dict):
         raise ValueError("清单必须是 JSON 对象")
     if "spdxVersion" in sbom:
-        return _parse_spdx(sbom)
-    return _parse_cyclonedx(sbom)
+        document = _parse_spdx_document(sbom)
+    else:
+        document = _parse_cyclonedx_document(sbom)
+    return document.build()
 
 
-def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
-    """Validate a CycloneDX 1.5 SBOM and return (identities, edges)."""
+def _parse_cyclonedx_document(sbom: dict) -> _SbomDocument:
+    """Validate a CycloneDX 1.5 SBOM into the shared document model."""
     if sbom.get("bomFormat") != "CycloneDX":
         raise ValueError("bomFormat 必须为 CycloneDX")
     if sbom.get("specVersion") != "1.5":
@@ -557,7 +617,6 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
                 raise ValueError("metadata.component.bom-ref 必须为非空字符串")
 
     identities: dict[str, tuple[str, str, str]] = {}
-    identity_set: set[tuple[str, str, str]] = set()
     for index, component in enumerate(components):
         if not isinstance(component, dict):
             raise ValueError(f"components[{index}] 必须为对象")
@@ -588,11 +647,9 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
                 raise ValueError(
                     f"components[{index}] (bom-ref {ref}) version 与 purl 版本不一致"
                 )
-        identity = (ecosystem, name, version)
-        identities[ref] = identity
-        identity_set.add(identity)
+        identities[ref] = (ecosystem, name, version)
 
-    edges: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
+    edges: list[tuple[str, str]] = []
     dependencies = sbom.get("dependencies", [])
     if not isinstance(dependencies, list):
         raise ValueError("dependencies 必须为数组")
@@ -610,7 +667,6 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
             continue
         if ref not in identities:
             raise ValueError(f"dependencies[{index}].ref 引用未知组件: {ref}")
-        dependent_identity = identities[ref]
         for target in depends_on:
             if not isinstance(target, str) or not target:
                 raise ValueError(
@@ -624,14 +680,9 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
                 raise ValueError(
                     f"dependencies[{index}] 依赖引用未知组件: {target}"
                 )
-            dependency_identity = identities[target]
-            if dependent_identity == dependency_identity:
-                raise ValueError(
-                    f"合并后产生自依赖: {ref} -> {target}"
-                )
-            edges.add((dependent_identity, dependency_identity))
+            edges.append((ref, target))
 
-    return identity_set, edges
+    return _SbomDocument(identities=identities, edges=edges, root_ref=root_ref)
 
 
 def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, str]:
@@ -666,8 +717,8 @@ def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, 
     return identity
 
 
-def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
-    """Validate an SPDX 2.3 JSON document and return (identities, edges)."""
+def _parse_spdx_document(document: dict) -> _SbomDocument:
+    """Validate an SPDX 2.3 JSON document into the shared document model."""
     if document.get("spdxVersion") != "SPDX-2.3":
         raise ValueError("spdxVersion 必须为 SPDX-2.3")
     document_spdxid = document.get("SPDXID")
@@ -680,7 +731,6 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
         raise ValueError("packages 必须为数组")
 
     identities: dict[str, tuple[str, str, str]] = {}
-    identity_set: set[tuple[str, str, str]] = set()
     for index, package in enumerate(packages):
         if not isinstance(package, dict):
             raise ValueError(f"packages[{index}] 必须为对象")
@@ -703,9 +753,8 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
                     f"packages[{index}] (SPDXID {spdxid}) versionInfo 与 purl 版本不一致"
                 )
         identities[spdxid] = identity
-        identity_set.add(identity)
 
-    edges: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
+    edges: list[tuple[str, str]] = []
     if "relationships" in document:
         relationships = document["relationships"]
         if not isinstance(relationships, list):
@@ -742,15 +791,9 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
             raise ValueError(f"relationships[{index}] 引用未知标识: {source}")
         if target not in identities:
             raise ValueError(f"relationships[{index}] 引用未知标识: {target}")
-        dependent_identity = identities[source]
-        dependency_identity = identities[target]
-        if dependent_identity == dependency_identity:
-            raise ValueError(
-                f"合并后产生自依赖: {source} -> {target}"
-            )
-        edges.add((dependent_identity, dependency_identity))
+        edges.append((source, target))
 
-    return identity_set, edges
+    return _SbomDocument(identities=identities, edges=edges, root_ref=document_spdxid)
 
 
 class Catalog:
