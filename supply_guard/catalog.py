@@ -1264,10 +1264,19 @@ class Catalog:
                         }
         return groups
 
-    def _components_by_id(self) -> dict[int, dict[str, str]]:
-        rows = self.connection.execute(
-            "SELECT id, service, ecosystem, name, version FROM components"
-        )
+    def _components_by_id(
+        self, service: str | None = None
+    ) -> dict[int, dict[str, str]]:
+        if service is None:
+            rows = self.connection.execute(
+                "SELECT id, service, ecosystem, name, version FROM components"
+            )
+        else:
+            rows = self.connection.execute(
+                "SELECT id, service, ecosystem, name, version FROM components "
+                "WHERE service = ?",
+                (service,),
+            )
         return {
             int(row["id"]): {
                 "service": str(row["service"]),
@@ -1278,12 +1287,29 @@ class Catalog:
             for row in rows
         }
 
-    def _dependency_edges(self) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    def _dependency_edges(
+        self, component_ids: set[int] | None = None
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+        # Dependencies never cross services, so a service-scoped graph only
+        # needs edges whose endpoints belong to the loaded components.
+        if component_ids is None:
+            rows = self.connection.execute(
+                "SELECT dependent_id, dependency_id FROM dependencies"
+            )
+        else:
+            if not component_ids:
+                return {}, {}
+            id_list = sorted(component_ids)
+            placeholders = ", ".join("?" for _ in id_list)
+            rows = self.connection.execute(
+                "SELECT dependent_id, dependency_id FROM dependencies "
+                f"WHERE dependent_id IN ({placeholders}) "
+                f"AND dependency_id IN ({placeholders})",
+                (*id_list, *id_list),
+            )
         forward: dict[int, list[int]] = {}
         reverse: dict[int, list[int]] = {}
-        for row in self.connection.execute(
-            "SELECT dependent_id, dependency_id FROM dependencies"
-        ):
+        for row in rows:
             dependent = int(row["dependent_id"])
             dependency = int(row["dependency_id"])
             forward.setdefault(dependent, []).append(dependency)
@@ -1350,7 +1376,7 @@ class Catalog:
         return distance
 
     def _impact_graph(
-        self,
+        self, service: str | None = None
     ) -> tuple[
         dict[int, dict[str, str]],
         dict[int, list[int]],
@@ -1364,9 +1390,16 @@ class Catalog:
         records are gathered into the same direct-hit groups, so a change to
         propagation or path rules applies to every vulnerability source at
         once.
+
+        When ``service`` is given, only that service's components, dependency
+        edges and hits participate: identically named components, dependencies
+        and exemptions of other services never enter the analysis, so an
+        unparseable component version registered elsewhere cannot fail a
+        scoped query. Dependencies never cross services, so limiting the
+        graph this way leaves every in-service propagation path intact.
         """
-        components = self._components_by_id()
-        forward, reverse = self._dependency_edges()
+        components = self._components_by_id(service)
+        forward, reverse = self._dependency_edges(set(components))
         return components, forward, reverse, self._direct_hits(components)
 
     @staticmethod
@@ -1462,14 +1495,8 @@ class Catalog:
                     "service is required when filtering by component identity"
                 )
 
-        records = self._impact_records()
+        records = self._impact_records(service)
 
-        if service is not None:
-            records = [
-                record
-                for record in records
-                if record["component"]["service"] == service
-            ]
         if all(value is not None for value in identity_filter):
             records = [
                 record
@@ -1482,7 +1509,7 @@ class Catalog:
         records.sort(key=_impact_sort_key)
         return records
 
-    def _impact_records(self) -> list[dict]:
+    def _impact_records(self, service: str | None = None) -> list[dict]:
         """All current impact records, unfiltered and in an unspecified order.
 
         One record per (component, vulnerability, source, matched package),
@@ -1492,8 +1519,14 @@ class Catalog:
         basis). Every group goes through the same shortest-path propagation
         and record construction, so propagation rules live in exactly one
         place.
+
+        With ``service`` set, analysis runs over that service's graph alone,
+        so transitive impacts through the target component's dependencies are
+        still found while identically named components of other services can
+        neither leak into the records nor abort the query with their own
+        unparseable versions.
         """
-        components, forward, reverse, direct_groups = self._impact_graph()
+        components, forward, reverse, direct_groups = self._impact_graph(service)
         records: list[dict] = []
 
         for (source, identifier, matched_name), terminals in direct_groups.items():
@@ -2073,16 +2106,12 @@ class Catalog:
         else:
             moment = parse_timestamp(evaluated_at, "评估时刻")
 
-        records = self._impact_records()
         if service is not None:
             service = service.strip()
             if not service:
                 raise ValueError("service 不能为空")
-            records = [
-                record
-                for record in records
-                if record["component"]["service"] == service
-            ]
+
+        records = self._impact_records(service)
 
         active = self._active_exemptions(moment)
         reported: list[dict] = []

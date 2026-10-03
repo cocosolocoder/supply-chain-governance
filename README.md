@@ -69,6 +69,18 @@ Each impact record carries the affected component identity, the vulnerability
 id and matched name, the severity, whether the hit is direct, and the
 shortest dependency path from the component to a directly hit component.
 
+A `--service` query is evaluated over that service's graph alone: components,
+dependencies and exemptions of other services never enter the result, and an
+unparseable component version registered in another service no longer aborts
+the query. Transitive impacts are still complete — when a full component
+identity is given, only the target component is shown, but everything it
+depends on keeps participating in the matching and propagation. A service
+with no registered components returns an empty list. If a component *within
+the selected service* needs to take part in OSV matching but carries a
+version PEP 440 cannot parse, the query still fails, naming the service,
+ecosystem, package and version. Directory-wide `impact` and `summary` keep
+the existing behavior: an unparseable version anywhere is an error.
+
 ## SBOM imports (CycloneDX and SPDX)
 
 `import-sbom` takes a service, a source name and a JSON file. The format is
@@ -210,6 +222,11 @@ python3 -m supply_guard.cli --database catalog.db risk-report \
 - `unhandled_component_count` counts distinct components that still have at
   least one unexempted record; `highest_severity` considers only unexempted
   records and is `null` when none remain;
+- with `--service`, impacts, the unhandled count and the highest severity
+  reflect that service only; an unknown service keeps the normal report
+  structure with zero impacts, a zero count and `null` highest severity.
+  Other services' unparseable versions do not block the report, whereas one
+  inside the selected service still errors;
 - `--at` is a timezone-aware evaluation instant used **only** to judge whether
   an exemption term is in force; it defaults to now. Times compare in UTC and
   an exemption stops at its expiry instant. It does not freeze the directory

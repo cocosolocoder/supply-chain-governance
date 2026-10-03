@@ -733,6 +733,96 @@ class RiskReportTests(ExemptionFixture):
         )
 
 
+class ServiceScopedReportTests(ExemptionFixture):
+    """Scoped reports ignore other services' versions and exemptions."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # flask 1.0.0 in api and an OSV record matching it; the worker side
+        # gets an unparseable flask registration per test via the helper
+        # below (exemptions must be approved first, since request/approval
+        # deliberately validate against the directory-wide impact graph).
+        self.catalog.add_component("api", "pypi", "flask", "1.0.0")
+        self.catalog.import_osv(
+            "nvd",
+            [
+                osv_record("CVE-OSV", package="lib", severity="low",
+                           versions=["1.0.0"]),
+                osv_record("CVE-F", package="flask", severity="high",
+                           versions=["1.0.0"]),
+            ],
+        )
+
+    def add_bad_worker_flask(self) -> None:
+        self.catalog.add_component("worker", "pypi", "flask", "not-a-version")
+
+    def test_other_service_bad_version_does_not_block_scoped_report(self) -> None:
+        self.add_bad_worker_flask()
+        report = self.catalog.risk_report(service="api")
+        self.assertEqual(report["service"], "api")
+        self.assertTrue(
+            all(i["component"]["service"] == "api" for i in report["impacts"])
+        )
+        names = {
+            (i["component"]["name"], i["vulnerability"])
+            for i in report["impacts"]
+        }
+        self.assertIn(("flask", "CVE-F"), names)
+
+    def test_scoped_report_applies_only_same_service_exemptions(self) -> None:
+        # Approve an exemption for the api flask record while directory-wide
+        # validation still works ...
+        self.catalog.request_exemption(
+            "REQ-F-API", "api", "pypi", "flask", "1.0.0", "CVE-F", "flask",
+            "nvd", "alice", "accept", self.future,
+        )
+        self.catalog.approve_exemption("REQ-F-API", "bob", "ok")
+        # ... and one scoped to the worker lib record, which must never apply
+        # to api's identically named lib.
+        self.catalog.request_exemption(
+            "REQ-LIB-WORKER", "worker", "pypi", "lib", "1.0.0", "CVE-OSV",
+            "lib", "nvd", "alice", "accept", self.future,
+        )
+        self.catalog.approve_exemption("REQ-LIB-WORKER", "bob", "ok")
+        self.add_bad_worker_flask()
+
+        report = self.catalog.risk_report(service="api")
+        flask = next(
+            i for i in report["impacts"]
+            if i["component"]["name"] == "flask" and i["vulnerability"] == "CVE-F"
+        )
+        self.assertTrue(flask["exempted"])
+        self.assertEqual(flask["exemption_request"], "REQ-F-API")
+        lib_osv = next(
+            i for i in report["impacts"]
+            if i["component"]["name"] == "lib" and i["vulnerability"] == "CVE-OSV"
+        )
+        self.assertFalse(lib_osv["exempted"])
+        self.assertIsNone(lib_osv["exemption_request"])
+        # Counts and the highest severity reflect api records only; the
+        # exempted flask is excluded from both.
+        self.assertEqual(report["unhandled_component_count"], 3)
+        self.assertEqual(report["highest_severity"], "high")
+
+    def test_scoped_report_with_in_service_bad_version_still_errors(self) -> None:
+        self.add_bad_worker_flask()
+        with self.assertRaises(ValueError) as context:
+            self.catalog.risk_report(service="worker")
+        self.assertIn("worker/pypi/flask/not-a-version", str(context.exception))
+
+    def test_scoped_report_query_does_not_touch_exemption_history(self) -> None:
+        self.catalog.request_exemption(
+            "REQ-F-API", "api", "pypi", "flask", "1.0.0", "CVE-F", "flask",
+            "nvd", "alice", "accept", self.future,
+        )
+        self.catalog.approve_exemption("REQ-F-API", "bob", "ok")
+        self.add_bad_worker_flask()
+        before = self.catalog.get_exemption("REQ-F-API")
+        self.catalog.risk_report(service="api")
+        self.catalog.impact(service="api")
+        self.assertEqual(self.catalog.get_exemption("REQ-F-API"), before)
+
+
 class PersistenceAndConcurrencyTests(unittest.TestCase):
     def test_persists_across_reopen_and_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

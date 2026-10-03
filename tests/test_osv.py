@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -386,6 +388,176 @@ class MatchingTests(unittest.TestCase):
             self.catalog.impact()
         self.assertIn("版本无法解析", str(context.exception))
         self.assertIn("api/pypi/flask/not-a-version", str(context.exception))
+
+
+class ServiceScopeIsolationTests(unittest.TestCase):
+    """Invalid versions registered in other services must not fail scoped queries."""
+
+    def setUp(self) -> None:
+        self.catalog = Catalog()
+        # api: app depends on flask 1.0.0
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "flask", "1.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "flask", "1.0.0"
+        )
+        # worker: another flask whose version PEP 440 cannot parse.
+        self.catalog.add_component("worker", "pypi", "flask", "not-a-version")
+        self.catalog.import_osv(
+            "nvd", [osv_record("CVE-2026-777", versions=["1.0.0"])]
+        )
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def test_scoped_impact_succeeds_with_full_direct_and_indirect_result(self) -> None:
+        records = self.catalog.impact(service="api")
+        by_name = {r["component"]["name"]: r for r in records}
+        self.assertEqual(set(by_name), {"app", "flask"})
+        self.assertTrue(by_name["flask"]["direct"])
+        self.assertFalse(by_name["app"]["direct"])
+        # The indirect explanation keeps the path app -> flask.
+        self.assertEqual(
+            [n["name"] for n in by_name["app"]["path"]], ["app", "flask"]
+        )
+        self.assertEqual(
+            [n["version"] for n in by_name["app"]["path"]], ["1.0.0", "1.0.0"]
+        )
+        self.assertEqual(by_name["app"]["vulnerability"], "CVE-2026-777")
+        self.assertEqual(by_name["app"]["source"], "nvd")
+
+    def test_scoped_impact_excludes_other_service_components(self) -> None:
+        records = self.catalog.impact(service="api")
+        self.assertTrue(
+            all(r["component"]["service"] == "api" for r in records)
+        )
+        self.assertFalse(
+            any(
+                r["component"]["name"] == "flask"
+                and r["component"]["version"] == "not-a-version"
+                for r in records
+            )
+        )
+
+    def test_identity_filter_keeps_transitive_impacts_in_judgement(self) -> None:
+        # Showing only app still relies on flask participating in OSV
+        # matching: the indirect hit must not be dropped just because flask
+        # is absent from the final component list.
+        records = self.catalog.impact(
+            service="api", ecosystem="pypi", name="app", version="1.0.0"
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["component"]["name"], "app")
+        self.assertFalse(records[0]["direct"])
+        self.assertEqual(
+            [n["name"] for n in records[0]["path"]], ["app", "flask"]
+        )
+
+    def test_in_service_unparseable_version_still_errors(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            self.catalog.impact(service="worker")
+        message = str(context.exception)
+        self.assertIn("版本无法解析", message)
+        self.assertIn("worker/pypi/flask/not-a-version", message)
+
+    def test_unknown_service_returns_empty_impacts(self) -> None:
+        self.assertEqual(self.catalog.impact(service="ghost"), [])
+
+    def test_scoped_risk_report_counts_and_highest_reflect_only_service(self) -> None:
+        report = self.catalog.risk_report(service="api")
+        self.assertEqual(report["service"], "api")
+        self.assertEqual(report["impact_count"], 2)
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "medium")
+        self.assertTrue(
+            all(i["component"]["service"] == "api" for i in report["impacts"])
+        )
+
+    def test_scoped_risk_report_with_in_service_bad_version_errors(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            self.catalog.risk_report(service="worker")
+        self.assertIn("worker/pypi/flask/not-a-version", str(context.exception))
+
+    def test_scoped_risk_report_unknown_service_is_empty_report(self) -> None:
+        report = self.catalog.risk_report(service="ghost")
+        self.assertEqual(report["impact_count"], 0)
+        self.assertEqual(report["unhandled_component_count"], 0)
+        self.assertIsNone(report["highest_severity"])
+        self.assertEqual(report["impacts"], [])
+        self.assertEqual(report["service"], "ghost")
+
+    def test_unscoped_queries_keep_raising_on_any_bad_version(self) -> None:
+        with self.assertRaises(ValueError):
+            self.catalog.impact()
+        with self.assertRaises(ValueError):
+            self.catalog.summary()
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report()
+
+    def test_successful_scoped_query_does_not_modify_data(self) -> None:
+        def snapshot():
+            return (
+                self.catalog.connection.execute(
+                    "SELECT service, ecosystem, name, version FROM components "
+                    "ORDER BY service, ecosystem, name, version"
+                ).fetchall(),
+                self.catalog.connection.execute(
+                    "SELECT id, source, package_name FROM osv_vulnerabilities "
+                    "ORDER BY id"
+                ).fetchall(),
+            )
+
+        before = snapshot()
+        self.catalog.impact(service="api")
+        self.catalog.risk_report(service="api")
+        self.assertEqual(snapshot(), before)
+        # The worker's invalid registration is still present and still
+        # makes a directory-wide query fail.
+        with self.assertRaises(ValueError):
+            self.catalog.impact()
+
+    def test_cli_scoped_impact_succeeds_while_worker_version_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            osv_path = Path(directory, "osv.json")
+            osv_path.write_text(
+                osv_file([osv_record("CVE-2026-777", versions=["1.0.0"])])
+            )
+            self.assertEqual(
+                main(["--database", database, "import-osv", "nvd", str(osv_path)]),
+                0,
+            )
+            for args in (
+                ["add-component", "api", "pypi", "app", "1.0.0"],
+                ["add-component", "api", "pypi", "flask", "1.0.0"],
+                [
+                    "add-dependency", "api", "pypi", "app", "1.0.0",
+                    "api", "pypi", "flask", "1.0.0",
+                ],
+                ["add-component", "worker", "pypi", "flask", "not-a-version"],
+            ):
+                self.assertEqual(
+                    main(["--database", database, *args]), 0
+                )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = main(
+                    ["--database", database, "impact", "--service", "api"]
+                )
+            self.assertEqual(status, 0)
+            records = json.loads(stdout.getvalue())
+            self.assertEqual({r["component"]["name"] for r in records},
+                             {"app", "flask"})
+
+            # The worker service still fails with a non-zero status.
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = main(
+                    ["--database", database, "impact", "--service", "worker"]
+                )
+            self.assertEqual(status, 1)
+            self.assertIn("worker/pypi/flask/not-a-version", stderr.getvalue())
 
 
 class ImportBehaviorTests(unittest.TestCase):
