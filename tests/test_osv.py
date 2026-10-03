@@ -624,6 +624,121 @@ class ImpactAndSummaryTests(unittest.TestCase):
         second = self.catalog.impact()
         self.assertEqual(first, second)
 
+    def test_terminal_conditions_follow_the_chosen_path(self) -> None:
+        # The same normalized package is directly hit at two versions with
+        # different explicit conditions; each dependent's explanation must
+        # use the conditions of the terminal component of its own path.
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "x", "1.0.0")
+        self.catalog.add_component("api", "pypi", "y", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib", "2.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "x", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "x", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "y", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "y", "1.0.0", "api", "pypi", "lib", "2.0.0"
+        )
+        self.catalog.import_osv(
+            "src",
+            [osv_record("CVE-1", package="lib", versions=["1.0.0", "2.0.0"])],
+        )
+        records = {r["component"]["name"]: r for r in self.catalog.impact()}
+        self.assertEqual(
+            [n["name"] + n["version"] for n in records["x"]["path"]],
+            ["x1.0.0", "lib1.0.0"],
+        )
+        self.assertEqual(records["x"]["matched_conditions"], ["==1.0.0"])
+        self.assertEqual(
+            [n["name"] + n["version"] for n in records["y"]["path"]],
+            ["y1.0.0", "lib2.0.0"],
+        )
+        self.assertEqual(records["y"]["matched_conditions"], ["==2.0.0"])
+        # app reaches both terminals in two hops; one record, ending at the
+        # identity-smallest terminal, with that terminal's conditions only.
+        app_records = [
+            r for r in self.catalog.impact() if r["component"]["name"] == "app"
+        ]
+        self.assertEqual(len(app_records), 1)
+        self.assertEqual(
+            [n["name"] + n["version"] for n in app_records[0]["path"]],
+            ["app1.0.0", "x1.0.0", "lib1.0.0"],
+        )
+        self.assertEqual(app_records[0]["matched_conditions"], ["==1.0.0"])
+
+    def test_output_is_independent_of_registration_order(self) -> None:
+        def build(reversed_order: bool):
+            catalog = Catalog()
+            components = [
+                ("api", "pypi", "app", "1.0.0"),
+                ("api", "pypi", "x", "1.0.0"),
+                ("api", "pypi", "y", "1.0.0"),
+                ("api", "pypi", "lib", "1.0.0"),
+                ("api", "pypi", "lib", "2.0.0"),
+            ]
+            dependencies = [
+                ("api", "pypi", "app", "1.0.0", "api", "pypi", "x", "1.0.0"),
+                ("api", "pypi", "x", "1.0.0", "api", "pypi", "lib", "1.0.0"),
+                ("api", "pypi", "app", "1.0.0", "api", "pypi", "y", "1.0.0"),
+                ("api", "pypi", "y", "1.0.0", "api", "pypi", "lib", "2.0.0"),
+                # Cycle back to app: propagation must still terminate.
+                ("api", "pypi", "lib", "1.0.0", "api", "pypi", "app", "1.0.0"),
+            ]
+            records = [osv_record("CVE-1", package="lib", versions=["1.0.0", "2.0.0"])]
+            ordered_components = (
+                reversed(components) if reversed_order else components
+            )
+            for component in ordered_components:
+                catalog.add_component(*component)
+            ordered_dependencies = (
+                reversed(dependencies) if reversed_order else dependencies
+            )
+            for dependency in ordered_dependencies:
+                catalog.add_dependency(*dependency)
+            catalog.import_osv("src", records)
+            return catalog
+
+        first = build(False)
+        second = build(True)
+        self.assertEqual(first.impact(), second.impact())
+        for record in first.impact():
+            identities = [
+                (n["service"], n["ecosystem"], n["name"], n["version"])
+                for n in record["path"]
+            ]
+            self.assertEqual(len(identities), len(set(identities)))
+        first.close()
+        second.close()
+
+    def test_same_id_manual_and_osv_keep_distinct_explanations(self) -> None:
+        self.catalog.add_component("api", "pypi", "flask", "1.0.0")
+        self.catalog.add_vulnerability("CVE-1", "flask", "high")
+        self.catalog.import_osv(
+            "src",
+            [osv_record(
+                "CVE-1",
+                versions=["1.0.0"],
+                database_specific={"severity": "low"},
+            )],
+        )
+        records = sorted(self.catalog.impact(), key=lambda r: r["source"] or "")
+        self.assertEqual(len(records), 2)
+        manual, imported = records
+        self.assertIsNone(manual["source"])
+        self.assertIsNone(manual["severity_basis"])
+        self.assertIsNone(manual["matched_conditions"])
+        self.assertEqual(manual["severity"], "high")
+        self.assertEqual(imported["source"], "src")
+        self.assertEqual(imported["severity_basis"], "declared")
+        self.assertEqual(imported["matched_conditions"], ["==1.0.0"])
+        self.assertEqual(imported["severity"], "low")
+
 
 class CliTests(unittest.TestCase):
     def test_import_osv_command(self) -> None:
