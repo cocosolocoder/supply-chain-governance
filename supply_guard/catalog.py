@@ -8,9 +8,46 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote
 
 from packaging.version import InvalidVersion, Version
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def decode_purl_component(value: str, field: str) -> str:
+    """Percent-decode one identity-bearing component of a purl.
+
+    Every ``%`` must begin a complete two-hex-digit escape and the decoded
+    bytes must form valid UTF-8 text. Anything else — a bare or truncated
+    escape, non-hex digits, or bytes that cannot be restored to UTF-8 — is
+    rejected rather than silently kept or turned into replacement
+    characters, which would merge distinct package names into one identity.
+    Decoding happens exactly once: a percent produced by a ``%25`` escape is
+    literal and never interpreted as another escape.
+    """
+    decoded = bytearray()
+    index = 0
+    length = len(value)
+    while index < length:
+        char = value[index]
+        if char != "%":
+            decoded.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        if index + 2 >= length or any(
+            value[index + offset] not in _HEX_DIGITS for offset in (1, 2)
+        ):
+            raise ValueError(
+                f"purl {field}含有非法百分号转义：每个 % 后必须紧跟两个十六进制数字"
+            )
+        decoded.append(int(value[index + 1:index + 3], 16))
+        index += 3
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"purl {field}的百分号编码字节无法还原为 UTF-8 文本"
+        ) from error
 
 
 SCHEMA = """
@@ -437,9 +474,12 @@ class ImportResult:
 def parse_purl(purl: object) -> tuple[str, str, str]:
     """Return (ecosystem, name, version) from a Package URL.
 
-    Percent-encoding is decoded and npm package names keep their scope.
-    Raises ValueError when the purl is missing, malformed, unsupported or
-    carries no version.
+    Percent-encoding is decoded once and npm package names keep their scope.
+    Every percent sign in the ecosystem, package name, npm scope and version
+    must form a complete two-hex-digit escape whose bytes restore to UTF-8;
+    otherwise the purl is rejected so that an unrepairable identity can never
+    reach the catalog. Raises ValueError when the purl is missing, malformed,
+    unsupported or carries no version.
     """
     if not isinstance(purl, str) or not purl:
         raise ValueError("purl 必须为非空字符串")
@@ -449,7 +489,7 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     if "/" not in rest:
         raise ValueError("purl 格式无效")
     raw_type, path = rest.split("/", 1)
-    ecosystem = unquote(raw_type).lower()
+    ecosystem = decode_purl_component(raw_type, "生态类型").lower()
     if ecosystem not in SUPPORTED_ECOSYSTEMS:
         raise ValueError(f"不支持的包类型: {ecosystem}")
     # Strip qualifiers (?...) and subpath (#...).
@@ -457,21 +497,23 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     if "@" not in path:
         raise ValueError("purl 缺少版本")
     name_part, version = path.rsplit("@", 1)
-    version = unquote(version)
+    version = decode_purl_component(version, "版本")
     if not version:
         raise ValueError("purl 版本为空")
-    segments = [unquote(segment) for segment in name_part.split("/") if segment != ""]
+    raw_segments = [segment for segment in name_part.split("/") if segment != ""]
     if ecosystem == "npm":
-        if len(segments) == 1:
-            name = segments[0]
-        elif len(segments) == 2:
-            name = segments[0] + "/" + segments[1]
+        if len(raw_segments) == 1:
+            name = decode_purl_component(raw_segments[0], "包名")
+        elif len(raw_segments) == 2:
+            scope = decode_purl_component(raw_segments[0], "npm 作用域")
+            package = decode_purl_component(raw_segments[1], "包名")
+            name = scope + "/" + package
         else:
             raise ValueError("npm purl 格式无效")
     else:
-        if len(segments) != 1:
+        if len(raw_segments) != 1:
             raise ValueError("pypi purl 不应包含命名空间")
-        name = segments[0]
+        name = decode_purl_component(raw_segments[0], "包名")
     if not name:
         raise ValueError("purl 包名为空")
     return ecosystem, name, version

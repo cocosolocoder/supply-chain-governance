@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -43,6 +45,41 @@ class PurlParsingTests(unittest.TestCase):
         self.assertEqual(
             parse_purl("pkg:pypi/my%2Dpkg@1%2E0%2E0"), ("pypi", "my-pkg", "1.0.0")
         )
+
+    def test_percent_encoding_hex_case_insensitive(self) -> None:
+        self.assertEqual(
+            parse_purl("pkg:pypi/my%2dpkg@1%2e0"), ("pypi", "my-pkg", "1.0")
+        )
+        self.assertEqual(
+            parse_purl("pkg:pypi/my%2dpkg@1%2E0"), ("pypi", "my-pkg", "1.0")
+        )
+
+    def test_percent_encoding_decoded_once(self) -> None:
+        # %25 restores a literal percent sign that must not be decoded again.
+        self.assertEqual(
+            parse_purl("pkg:pypi/a%2525b@1"), ("pypi", "a%25b", "1")
+        )
+        self.assertEqual(
+            parse_purl("pkg:pypi/100%25@1%2E0"), ("pypi", "100%", "1.0")
+        )
+
+    def test_illegal_percent_escapes_rejected(self) -> None:
+        for bad in (
+            "pkg:pypi/foo%bar@1",
+            "pkg:pypi/foo%A@1",
+            "pkg:pypi/foo%GG@1",
+            "pkg:pypi/foo%ff@1",
+            "pkg:pypi/foo%E4%B8@1",
+            "pkg:pypi/foo@1%",
+            "pkg:pypi/foo@1%2",
+            "pkg:pypi/foo@%GG",
+            "pkg:npm/%40sc%GG/pkg@1.0",
+            "pkg:npm/%GGscope/pkg@1.0",
+            "pkg:%70%79pi/foo@1%FF",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_purl(bad)
 
     def test_type_is_case_insensitive(self) -> None:
         self.assertEqual(parse_purl("pkg:PyPI/foo@1"), ("pypi", "foo", "1"))
@@ -333,6 +370,133 @@ class ImportValidationTests(unittest.TestCase):
             self.catalog.import_sbom("", "src", sbom([]))
         with self.assertRaises(ValueError):
             self.catalog.import_sbom("api", "  ", sbom([]))
+
+    def test_bad_percent_escape_names_component_location_and_bomref(self) -> None:
+        for bad_purl in (
+            "pkg:pypi/foo%bar@1",
+            "pkg:pypi/foo%ff@1",
+            "pkg:pypi/foo@1%E4%B8",
+            "pkg:npm/%GGscope/pkg@1",
+        ):
+            with self.subTest(bad_purl=bad_purl):
+                catalog = Catalog()
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_sbom(
+                        "api",
+                        "src",
+                        sbom([component("comp-7", bad_purl)]),
+                    )
+                message = str(caught.exception)
+                self.assertIn("components[0]", message)
+                self.assertIn("comp-7", message)
+                catalog.close()
+
+    def test_corrupt_purl_fails_whole_import_without_earlier_components(self) -> None:
+        # A valid component listed first must not survive a later bad purl.
+        with self.assertRaises(ValueError):
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                sbom(
+                    [
+                        component("good", "pkg:pypi/foo@1"),
+                        component("bad", "pkg:pypi/bar%ff@1"),
+                    ]
+                ),
+            )
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_corrupt_replacement_keeps_previous_source_declaration(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("a", "pkg:pypi/foo@1"),
+                    component("b", "pkg:pypi/bar@1"),
+                ],
+                [{"ref": "a", "dependsOn": ["b"]}],
+            ),
+        )
+        self.catalog.import_sbom(
+            "api", "other", sbom([component("c", "pkg:pypi/baz@1")])
+        )
+        self.catalog.add_component("api", "pypi", "manual", "1")
+        self.catalog.add_vulnerability("CVE-1", "bar", "high")
+
+        with self.assertRaises(ValueError):
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                sbom(
+                    [
+                        component("a2", "pkg:pypi/newpkg@1"),
+                        component("bad", "pkg:pypi/broken%E4%B8@1"),
+                    ]
+                ),
+            )
+
+        # The replaced source keeps its original components and dependency.
+        rows = self.catalog.connection.execute(
+            """
+            SELECT c.name, cs.source_id IS NOT NULL AS owned
+            FROM components c
+            LEFT JOIN sources s ON s.service = 'api' AND s.name = 'src'
+            LEFT JOIN component_sources cs
+                ON cs.component_id = c.id AND cs.source_id = s.id
+            WHERE c.service = 'api'
+            ORDER BY c.name
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(r["name"], r["owned"]) for r in rows],
+            [("bar", 1), ("baz", 0), ("foo", 1), ("manual", 0)],
+        )
+        edges = self.catalog.connection.execute(
+            """
+            SELECT d1.name AS dependent, d2.name AS dependency
+            FROM dependencies
+            JOIN components d1 ON dependent_id = d1.id
+            JOIN components d2 ON dependency_id = d2.id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(r["dependent"], r["dependency"]) for r in edges],
+            [("foo", "bar")],
+        )
+        # Queries and the risk report still reflect the pre-import data.
+        records = self.catalog.impact()
+        self.assertEqual(len(records), 2)
+        report = self.catalog.risk_report()
+        self.assertEqual(report["impact_count"], 2)
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(
+            sorted(item["component"]["name"] for item in report["impacts"]),
+            ["bar", "foo"],
+        )
+
+    def test_other_sources_survive_corrupt_import(self) -> None:
+        self.catalog.import_sbom(
+            "api", "other", sbom([component("c", "pkg:pypi/baz@1")])
+        )
+        with self.assertRaises(ValueError):
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                sbom([component("bad", "pkg:pypi/broken%GG@1")]),
+            )
+        names = [
+            r["name"]
+            for r in self.catalog.connection.execute(
+                "SELECT name FROM components WHERE service = 'api'"
+            )
+        ]
+        self.assertEqual(names, ["baz"])
 
 
 class ImportReplacementTests(unittest.TestCase):
@@ -1001,6 +1165,42 @@ class ImportCliTests(unittest.TestCase):
                 catalog.connection.execute("SELECT COUNT(*) FROM components").fetchone()[0],
                 1,
             )
+            catalog.close()
+
+    def test_corrupt_percent_escape_returns_nonzero_without_success_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            good = Path(directory, "good.json")
+            good.write_text(
+                json.dumps(sbom([component("a", "pkg:pypi/foo@1")]))
+            )
+            bad = Path(directory, "bad.json")
+            bad.write_text(
+                json.dumps(sbom([component("ref-bad", "pkg:pypi/bar%ff@1")]))
+            )
+            self.assertEqual(
+                main(["--database", database, "import-sbom", "api", "src", str(good)]),
+                0,
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = main(
+                    ["--database", database, "import-sbom", "api", "src", str(bad)]
+                )
+            self.assertEqual(status, 1)
+            # No success statistics are printed on failure.
+            self.assertNotIn("来源组件数", stdout.getvalue())
+            # The error names the component location and its bom-ref.
+            self.assertIn("components[0]", stderr.getvalue())
+            self.assertIn("ref-bad", stderr.getvalue())
+            catalog = Catalog(database)
+            names = [
+                r["name"]
+                for r in catalog.connection.execute(
+                    "SELECT name FROM components WHERE service = 'api'"
+                )
+            ]
+            self.assertEqual(names, ["foo"])
             catalog.close()
 
 

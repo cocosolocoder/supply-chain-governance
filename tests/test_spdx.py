@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -452,6 +454,129 @@ class SpdxValidationTests(unittest.TestCase):
         )
         self.assertEqual(result.source_components, 1)
 
+    def test_percent_encoding_restored_once(self) -> None:
+        result = self.catalog.import_sbom(
+            "api",
+            "src",
+            spdx([package("SPDXRef-a", "pkg:pypi/lib%2Dcore@1%2E0")]),
+        )
+        self.assertEqual(result.source_components, 1)
+        row = self.catalog.connection.execute(
+            "SELECT name, version FROM components WHERE service = 'api'"
+        ).fetchone()
+        self.assertEqual((row["name"], row["version"]), ("lib-core", "1.0"))
+
+    def test_corrupt_purl_names_package_location_and_spdxid(self) -> None:
+        for bad_purl in (
+            "pkg:pypi/foo%bar@1",
+            "pkg:pypi/foo%ff@1",
+            "pkg:pypi/foo@%E4%B8",
+            "pkg:npm/%GGscope/pkg@1",
+        ):
+            with self.subTest(bad_purl=bad_purl):
+                catalog = Catalog()
+                with self.assertRaises(ValueError) as caught:
+                    catalog.import_sbom(
+                        "api",
+                        "src",
+                        spdx([package("SPDXRef-Pkg-9", bad_purl)]),
+                    )
+                message = str(caught.exception)
+                self.assertIn("packages[0]", message)
+                self.assertIn("SPDXRef-Pkg-9", message)
+                catalog.close()
+
+    def test_one_corrupt_purl_fails_package_even_if_another_valid(self) -> None:
+        # The broken reference must not be skipped in favor of the valid one.
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/bar%ff@1"},
+                        ],
+                    )
+                ]
+            )
+        )
+        # Same rule regardless of ref ordering.
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo%GG@1"},
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                        ],
+                    )
+                ]
+            )
+        )
+
+    def test_corrupt_purl_fails_whole_import_without_earlier_packages(self) -> None:
+        with self.assertRaises(ValueError):
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                spdx(
+                    [
+                        package("SPDXRef-good", "pkg:pypi/foo@1"),
+                        package("SPDXRef-bad", "pkg:pypi/bar%ff@1"),
+                    ]
+                ),
+            )
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_corrupt_spdx_replacement_keeps_previous_source(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            spdx(
+                [
+                    package("SPDXRef-a", "pkg:pypi/foo@1"),
+                    package("SPDXRef-b", "pkg:pypi/bar@1"),
+                ],
+                [relationship("SPDXRef-a", "DEPENDS_ON", "SPDXRef-b")],
+            ),
+        )
+        with self.assertRaises(ValueError):
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                spdx(
+                    [
+                        package("SPDXRef-new", "pkg:pypi/newpkg@1"),
+                        package("SPDXRef-bad", "pkg:pypi/broken%E4%B8@1"),
+                    ]
+                ),
+            )
+        rows = self.catalog.connection.execute(
+            "SELECT name FROM components WHERE service = 'api' ORDER BY name"
+        ).fetchall()
+        self.assertEqual([r["name"] for r in rows], ["bar", "foo"])
+        edges = self.catalog.connection.execute(
+            """
+            SELECT d1.name AS dependent, d2.name AS dependency
+            FROM dependencies
+            JOIN components d1 ON dependent_id = d1.id
+            JOIN components d2 ON dependency_id = d2.id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(r["dependent"], r["dependency"]) for r in edges],
+            [("foo", "bar")],
+        )
+
     def test_relationship_validation(self) -> None:
         base = [
             package("SPDXRef-a", "pkg:pypi/foo@1"),
@@ -729,6 +854,40 @@ class SpdxCliTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+            catalog.close()
+
+    def test_corrupt_percent_escape_returns_nonzero_without_success_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            good = Path(directory, "good.json")
+            good.write_text(
+                json.dumps(spdx([package("SPDXRef-a", "pkg:pypi/foo@1")]))
+            )
+            bad = Path(directory, "bad.json")
+            bad.write_text(
+                json.dumps(spdx([package("SPDXRef-bad", "pkg:pypi/bar%ff@1")]))
+            )
+            self.assertEqual(
+                main(["--database", database, "import-sbom", "api", "src", str(good)]),
+                0,
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = main(
+                    ["--database", database, "import-sbom", "api", "src", str(bad)]
+                )
+            self.assertEqual(status, 1)
+            self.assertNotIn("来源组件数", stdout.getvalue())
+            self.assertIn("packages[0]", stderr.getvalue())
+            self.assertIn("SPDXRef-bad", stderr.getvalue())
+            catalog = Catalog(database)
+            names = [
+                r["name"]
+                for r in catalog.connection.execute(
+                    "SELECT name FROM components WHERE service = 'api'"
+                )
+            ]
+            self.assertEqual(names, ["foo"])
             catalog.close()
 
 

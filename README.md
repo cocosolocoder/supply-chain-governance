@@ -134,6 +134,23 @@ validation failures return a non-zero status naming the offending object
 and leave the previous source declaration and all other business data
 unchanged.
 
+Every percent sign in an identity-bearing purl part — ecosystem type,
+package name, npm scope and version — must start a complete two-hex-digit
+escape (`%2D`, `%40`, `%2e` …), in both CycloneDX and SPDX. A bare `%`, a
+truncated escape (`%A`) or non-hex digits (`%GG`) reject the whole import,
+and so do escapes whose decoded bytes cannot be restored to UTF-8 text
+(`%FF`, a truncated `%E4%B8`); a broken identity is never registered with
+the bad bytes kept or replaced by U+FFFD, which would merge distinct
+package names into one component. The error names the component's position
+in the document and its `bom-ref` (CycloneDX) or `SPDXID` (SPDX). For an
+SPDX package carrying several purl refs, one corrupt ref rejects the
+package even if another ref is valid — the bad ref is never skipped.
+Valid encodings continue to decode exactly once with the same identity
+rules: `pkg:pypi/lib%2Dcore@1%2E0` is `lib-core` version `1.0`,
+`pkg:npm/%40scope/pkg@1.0` stays `@scope/pkg`, hexadecimal case does not
+matter, and the percent produced by `%25` is literal and never decoded
+again. Qualifiers and subpaths still take no part in component identity.
+
 ## Local vulnerability exemptions
 
 A user can request an exemption for **one specific impact record**, another
