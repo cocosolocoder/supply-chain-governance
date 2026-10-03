@@ -910,6 +910,32 @@ class Catalog:
                 """,
                 (dependent_id, dependency_id),
             )
+            # The endpoints may have been retained solely by the revoked manual
+            # relationship. Each end is judged independently: a component leaves
+            # the catalog only when it is not manually registered, is declared by
+            # no source, and is no longer an endpoint of any remaining manual
+            # dependency. The only edge joining the two ends was the one just
+            # removed, so deleting one end cannot change the other end's result;
+            # unrelated components are never considered here.
+            for endpoint_id in (dependent_id, dependency_id):
+                self.connection.execute(
+                    """
+                    DELETE FROM components
+                    WHERE id = ?
+                      AND manual = 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM component_sources cs
+                          WHERE cs.component_id = components.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dependencies d
+                          WHERE d.manual = 1
+                            AND (d.dependent_id = components.id
+                                 OR d.dependency_id = components.id)
+                      )
+                    """,
+                    (endpoint_id,),
+                )
 
     def import_sbom(
         self, service: str, source_name: str, sbom: object

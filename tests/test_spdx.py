@@ -635,6 +635,33 @@ class SpdxReplacementTests(unittest.TestCase):
         )
         self.assertEqual(self.catalog.summary().affected_components, 0)
 
+    def test_remove_manual_dependency_clears_spdx_endpoints_immediately(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            spdx(
+                [
+                    package("SPDXRef-a", "pkg:pypi/app@1"),
+                    package("SPDXRef-b", "pkg:pypi/lib@1"),
+                ],
+                [relationship("SPDXRef-a", "DEPENDS_ON", "SPDXRef-b")],
+            ),
+        )
+        self.catalog.add_vulnerability("CVE-1", "lib", "high")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        self.catalog.import_sbom("api", "src", spdx([]))
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        # Same rule as CycloneDX: endpoints with no remaining basis leave at
+        # once and no longer produce impact records.
+        summary = self.catalog.summary()
+        self.assertEqual(summary.components, 0)
+        self.assertEqual(summary.affected_components, 0)
+        self.assertEqual(self.catalog.risk_report()["impact_count"], 0)
+
 
 class SpdxCliTests(unittest.TestCase):
     def test_import_spdx_file(self) -> None:

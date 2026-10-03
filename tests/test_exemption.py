@@ -482,6 +482,60 @@ class RiskReportTests(ExemptionFixture):
         self.assertEqual(record["status"], "approved")
         self.assertEqual(len(record["events"]), 2)
 
+    def test_component_deletion_keeps_source_data_and_exemption_history(self) -> None:
+        # Components removed through remove-dependency must not take the
+        # vulnerability source data or exemption requests/history with them.
+        catalog = Catalog()
+        catalog.import_sbom(
+            "api",
+            "src",
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {"bom-ref": "a", "purl": "pkg:pypi/app@1"},
+                    {"bom-ref": "b", "purl": "pkg:pypi/lib@1"},
+                ],
+                "dependencies": [{"ref": "a", "dependsOn": ["b"]}],
+            },
+        )
+        catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-OSV", package="lib", severity="high",
+                        versions=["1"])],
+        )
+        catalog.add_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        catalog.request_exemption(
+            "REQ-KEEP", "api", "pypi", "lib", "1", "CVE-OSV", "lib", "nvd",
+            "alice", "accept risk", self.future,
+        )
+        catalog.approve_exemption("REQ-KEEP", "bob", "ok")
+        catalog.import_sbom(
+            "api",
+            "src",
+            {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": []},
+        )
+        catalog.remove_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        # The components and their impact are gone...
+        self.assertEqual(catalog.summary().components, 0)
+        self.assertEqual(catalog.risk_report()["impact_count"], 0)
+        # ...but the OSV source data and the request with its full history
+        # remain, still queryable by their original id.
+        self.assertEqual(
+            catalog.connection.execute(
+                "SELECT COUNT(*) FROM osv_vulnerabilities"
+            ).fetchone()[0],
+            1,
+        )
+        record = catalog.get_exemption("REQ-KEEP")
+        self.assertEqual(record["status"], "approved")
+        self.assertEqual(len(record["events"]), 2)
+        catalog.close()
+
     def test_reappearing_impact_resumes_exemption(self) -> None:
         self.request("REQ-OSV", vulnerability="CVE-OSV", source="nvd")
         self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
