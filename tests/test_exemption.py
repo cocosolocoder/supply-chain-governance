@@ -723,6 +723,325 @@ class SeverityEscalationTests(ExemptionFixture):
         )
 
 
+class ApprovalReconfirmationRegressionTests(ExemptionFixture):
+    """Approve must judge the impact as it exists at approval time.
+
+    Between submission and approval the named OSV source may have been fully
+    re-imported. The approval therefore can neither keep the severity the
+    record carried when the request was filed, nor borrow a same-id record
+    from another source (or from manual registration) as its basis. These
+    tests replace the whole ``nvd`` source while one unexpired request is
+    pending and then drive the approval.
+    """
+
+    def replace_nvd(self, severity="high", fixed="2.0.0"):
+        """Re-import the named source with one range record on lib.
+
+        ``fixed='2.0.0'`` still affects lib/app/web at 1.0.0; ``fixed='1.0.0'``
+        removes the hit on 1.0.0 altogether (the range ends before it).
+        """
+        self.catalog.import_osv(
+            "nvd",
+            [osv_record(
+                "CVE-OSV", package="lib", severity=severity,
+                ranges=[{
+                    "type": "ECOSYSTEM",
+                    "events": [
+                        {"introduced": "0"},
+                        {"fixed": fixed},
+                    ],
+                }],
+            )],
+        )
+
+    def add_same_id_records_elsewhere(self):
+        # Another imported source and a manual observation share the id and
+        # package name but carry their own severity; neither belongs to the
+        # nvd scope of the pending request.
+        self.catalog.import_osv(
+            "ghsa",
+            [osv_record("CVE-OSV", package="lib", severity="medium",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.add_vulnerability("CVE-OSV", "lib", "critical")
+
+    def entry(self, report, name, source, vulnerability="CVE-OSV",
+              service="api"):
+        matches = [
+            i for i in report["impacts"]
+            if i["component"]["service"] == service
+            and i["component"]["name"] == name
+            and i["vulnerability"] == vulnerability
+            and i["source"] == source
+        ]
+        self.assertEqual(
+            len(matches), 1,
+            f"expected exactly one {name}/{vulnerability}/source={source} record",
+        )
+        return matches[0]
+
+    def request_nvd(self, name="lib"):
+        return self.request(
+            "REQ-OSV", name=name, vulnerability="CVE-OSV", source="nvd"
+        )
+
+    def assert_still_pristine_pending(self):
+        record = self.catalog.get_exemption("REQ-OSV")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approved_severity"])
+        self.assertIsNone(record["approver"])
+        self.assertIsNone(record["decided_at"])
+        self.assertIsNone(record["decision_note"])
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
+        return record
+
+    def test_direct_hit_approval_records_replaced_sources_high_level(self) -> None:
+        self.request_nvd()
+        # At submission the nvd record is the fixture's low one.
+        before = self.entry(
+            self.catalog.risk_report(service="api"), "lib", "nvd"
+        )
+        self.assertEqual(before["severity"], "low")
+
+        # Re-import the whole source: same id and package, still hitting 1.0.0,
+        # but upgraded to high. The import only swaps vulnerability data and
+        # must not append any request-processing event.
+        self.replace_nvd(severity="high", fixed="2.0.0")
+        pending = self.catalog.get_exemption("REQ-OSV")
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(
+            [event["action"] for event in pending["events"]], ["request"]
+        )
+
+        approved = self.catalog.approve_exemption(
+            "REQ-OSV", "bob", "controls verified"
+        )
+        # The saved level is the current high, never the submission-time low.
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["approved_severity"], "high")
+
+        # Component identity, source, applicant, reason and term are untouched.
+        scope = approved["scope"]
+        self.assertEqual(
+            (scope["service"], scope["ecosystem"], scope["name"],
+             scope["version"], scope["vulnerability"],
+             scope["matched_name"], scope["source"]),
+            ("api", "pypi", "lib", "1.0.0", "CVE-OSV", "lib", "nvd"),
+        )
+        self.assertEqual(approved["applicant"], "alice")
+        self.assertEqual(approved["reason"], "mitigated")
+        self.assertEqual(
+            approved["expires_at"], "2030-01-01T00:00:00.000000Z"
+        )
+        self.assertEqual(approved["approver"], "bob")
+        self.assertEqual(
+            [event["action"] for event in approved["events"]],
+            ["request", "approve"],
+        )
+        decision = approved["events"][1]
+        self.assertEqual(decision["actor"], "bob")
+        self.assertEqual(decision["reason"], "controls verified")
+        self.assertEqual(decision["from_status"], "pending")
+        self.assertEqual(decision["to_status"], "approved")
+
+        # The report marks the current nvd impact exempted under that request.
+        report = self.catalog.risk_report(service="api")
+        hit = self.entry(report, "lib", "nvd")
+        self.assertEqual(hit["severity"], "high")
+        self.assertTrue(hit["exempted"])
+        self.assertEqual(hit["exemption_request"], "REQ-OSV")
+        self.assertTrue(hit["direct"])
+        self.assertEqual(hit["matched_conditions"], ["<2.0.0"])
+
+    def test_same_id_other_source_and_manual_records_are_not_basis_or_exempted(
+        self,
+    ) -> None:
+        self.request_nvd()
+        self.replace_nvd(severity="high", fixed="2.0.0")
+        self.add_same_id_records_elsewhere()
+
+        # Only the nvd high level is recorded, despite the medium ghsa record
+        # and the critical manual one sharing id and package name.
+        approved = self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
+        self.assertEqual(approved["approved_severity"], "high")
+
+        report = self.catalog.risk_report(service="api")
+        nvd = self.entry(report, "lib", "nvd")
+        self.assertTrue(nvd["exempted"])
+        self.assertEqual(nvd["exemption_request"], "REQ-OSV")
+        # The other-source and manual same-id records keep their own scope:
+        # shown with their own severity, neither exempted nor linked.
+        ghsa = self.entry(report, "lib", "ghsa")
+        self.assertEqual(ghsa["severity"], "medium")
+        self.assertFalse(ghsa["exempted"])
+        self.assertIsNone(ghsa["exemption_request"])
+        manual = self.entry(report, "lib", None)
+        self.assertEqual(manual["severity"], "critical")
+        self.assertFalse(manual["exempted"])
+        self.assertIsNone(manual["exemption_request"])
+
+    def test_indirect_target_reconfirmed_via_current_dependency_path(self) -> None:
+        # app itself never matches the vulnerability; it is affected only
+        # through app -> web -> lib, so approval must follow the current graph.
+        self.request_nvd(name="app")
+        self.replace_nvd(severity="high", fixed="2.0.0")
+        self.add_same_id_records_elsewhere()
+
+        approved = self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["approved_severity"], "high")
+        self.assertEqual(approved["scope"]["name"], "app")
+        self.assertEqual(
+            [event["action"] for event in approved["events"]],
+            ["request", "approve"],
+        )
+
+        report = self.catalog.risk_report(service="api")
+        nvd = self.entry(report, "app", "nvd")
+        self.assertTrue(nvd["exempted"])
+        self.assertEqual(nvd["exemption_request"], "REQ-OSV")
+        self.assertFalse(nvd["direct"])
+        self.assertEqual(
+            [node["name"] for node in nvd["path"]], ["app", "web", "lib"]
+        )
+        self.assertEqual(nvd["matched_conditions"], ["<2.0.0"])
+        # The same indirect impact reached through other sources stays live.
+        ghsa = self.entry(report, "app", "ghsa")
+        self.assertFalse(ghsa["direct"])
+        self.assertFalse(ghsa["exempted"])
+        self.assertIsNone(ghsa["exemption_request"])
+        self.assertEqual(
+            [node["name"] for node in ghsa["path"]], ["app", "web", "lib"]
+        )
+        manual = self.entry(report, "app", None)
+        self.assertFalse(manual["exempted"])
+        self.assertIsNone(manual["exemption_request"])
+
+    def test_direct_approval_fails_when_replaced_source_stops_hitting(self) -> None:
+        self.request_nvd()
+        # The re-imported nvd range ends at 1.0.0 (exclusive), so lib 1.0.0 is
+        # no longer in range; other sources still carry the same id.
+        self.replace_nvd(severity="high", fixed="1.0.0")
+        self.add_same_id_records_elsewhere()
+
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
+        self.assert_still_pristine_pending()
+
+        report = self.catalog.risk_report(service="api")
+        # The nvd record is gone from the report entirely.
+        self.assertFalse(
+            any(i["source"] == "nvd" for i in report["impacts"])
+        )
+        # Nothing is marked exempted or linked to the failed approval; the
+        # same-id records from other scopes are merely still displayed.
+        self.assertFalse(any(i["exempted"] for i in report["impacts"]))
+        self.assertFalse(
+            any(i["exemption_request"] for i in report["impacts"])
+        )
+        ghsa = self.entry(report, "lib", "ghsa")
+        self.assertEqual(ghsa["severity"], "medium")
+        manual = self.entry(report, "lib", None)
+        self.assertEqual(manual["severity"], "critical")
+
+    def test_indirect_approval_fails_when_source_path_is_gone(self) -> None:
+        # app is only affected through the nvd-hit lib; once nvd no longer hits
+        # lib, a same-id hit imported from ghsa must not keep the nvd approval
+        # alive.
+        self.request_nvd(name="app")
+        self.replace_nvd(severity="high", fixed="1.0.0")
+        self.catalog.import_osv(
+            "ghsa",
+            [osv_record("CVE-OSV", package="lib", severity="medium",
+                        versions=["1.0.0"])],
+        )
+
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
+        record = self.assert_still_pristine_pending()
+        self.assertEqual(record["scope"]["source"], "nvd")
+        self.assertEqual(record["scope"]["name"], "app")
+
+        report = self.catalog.risk_report(service="api")
+        self.assertFalse(
+            any(i["source"] == "nvd" for i in report["impacts"])
+        )
+        # app is still affected by the same id, but via ghsa and unexempted.
+        ghsa = self.entry(report, "app", "ghsa")
+        self.assertFalse(ghsa["direct"])
+        self.assertFalse(ghsa["exempted"])
+        self.assertIsNone(ghsa["exemption_request"])
+        self.assertEqual(
+            [node["name"] for node in ghsa["path"]], ["app", "web", "lib"]
+        )
+        self.assertFalse(any(i["exempted"] for i in report["impacts"]))
+
+    def test_report_counts_follow_actual_unexempted_impacts(self) -> None:
+        # Minimal directory: one component carrying three same-id records
+        # (nvd, ghsa, manual). Several unexempted records on one component
+        # still count as a single unhandled component.
+        def catalog_with(nvd_fixed):
+            catalog = Catalog()
+            catalog.add_component("s", "pypi", "lib", "1.0.0")
+            catalog.import_osv(
+                "nvd",
+                [osv_record("CVE-OSV", package="lib", severity="low",
+                            versions=["1.0.0"])],
+            )
+            catalog.request_exemption(
+                "R", "s", "pypi", "lib", "1.0.0",
+                "CVE-OSV", "lib", "nvd",
+                "alice", "r", "2030-01-01T00:00:00+00:00",
+            )
+            catalog.import_osv(
+                "nvd",
+                [osv_record(
+                    "CVE-OSV", package="lib", severity="high",
+                    ranges=[{
+                        "type": "ECOSYSTEM",
+                        "events": [
+                            {"introduced": "0"},
+                            {"fixed": nvd_fixed},
+                        ],
+                    }],
+                )],
+            )
+            catalog.import_osv(
+                "ghsa",
+                [osv_record("CVE-OSV", package="lib", severity="medium",
+                            versions=["1.0.0"])],
+            )
+            catalog.add_vulnerability("CVE-OSV", "lib", "critical")
+            return catalog
+
+        # Success: the nvd high record alone is exempted; the medium/critical
+        # records still leave this one component unhandled, highest critical.
+        approved = catalog_with("2.0.0")
+        self.assertEqual(
+            approved.approve_exemption("R", "bob", "ok")["approved_severity"],
+            "high",
+        )
+        report = approved.risk_report()
+        self.assertEqual(report["impact_count"], 3)
+        self.assertEqual(report["unhandled_component_count"], 1)
+        self.assertEqual(report["highest_severity"], "critical")
+        approved.close()
+
+        # Failure: nvd dropped out of range, so the record vanishes and the
+        # approval is refused; the two remaining records still count once.
+        refused = catalog_with("1.0.0")
+        with self.assertRaises(ValueError):
+            refused.approve_exemption("R", "bob", "ok")
+        report = refused.risk_report()
+        self.assertEqual(report["impact_count"], 2)
+        self.assertEqual(report["unhandled_component_count"], 1)
+        self.assertEqual(report["highest_severity"], "critical")
+        self.assertFalse(any(i["exempted"] for i in report["impacts"]))
+        refused.close()
+
+
 class RiskReportTests(ExemptionFixture):
     def by(self, report, name, vulnerability="CVE-MAN", source=None,
            service="api"):
