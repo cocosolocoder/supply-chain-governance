@@ -430,6 +430,66 @@ class SpdxValidationTests(unittest.TestCase):
             )
         )
 
+    def test_corrupt_purl_rejected_with_position_and_spdxid(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                spdx(
+                    [
+                        package("SPDXRef-good", "pkg:pypi/foo@1"),
+                        package("SPDXRef-bad", "pkg:pypi/bar%GG@1"),
+                    ]
+                ),
+            )
+        message = str(caught.exception)
+        self.assertIn("packages[1]", message)
+        self.assertIn("SPDXRef-bad", message)
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_corrupt_purl_not_skipped_when_sibling_purl_valid(self) -> None:
+        # One corrupt purl poisons the package even when another purl of the
+        # same package is valid.
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                            {
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi/foo%FF@1",
+                            },
+                        ],
+                    )
+                ]
+            )
+        )
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi/foo%2@1",
+                            },
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                        ],
+                    )
+                ]
+            )
+        )
+
     def test_duplicate_purl_same_identity_allowed(self) -> None:
         result = self.catalog.import_sbom(
             "api",

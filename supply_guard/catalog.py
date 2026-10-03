@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote
 
 from packaging.version import InvalidVersion, Version
 
@@ -434,11 +433,50 @@ class ImportResult:
     deleted_dependencies: int
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _decode_percent_escapes(value: str, context: str) -> str:
+    """Decode percent-escapes in a single pass, rejecting anything broken.
+
+    Every ``%`` must introduce exactly two hexadecimal digits, and the
+    decoded byte sequence must be valid UTF-8. ``urllib.parse.unquote``
+    cannot be used here: it silently keeps broken escapes and replaces
+    undecodable bytes with U+FFFD, which would let corrupt input register
+    as a component identity and merge distinct raw names into one.
+    Decoding happens exactly once, so a ``%`` produced by decoding (from
+    ``%25``) is literal text, not a new escape.
+    """
+    if "%" not in value:
+        return value
+    raw = bytearray()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "%":
+            escape = value[index + 1 : index + 3]
+            if len(escape) != 2 or any(c not in _HEX_DIGITS for c in escape):
+                raise ValueError(f"{context}包含非法的百分号转义: {value!r}")
+            raw.append(int(escape, 16))
+            index += 3
+        else:
+            raw.extend(char.encode("utf-8"))
+            index += 1
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"{context}的编码字节无法还原为 UTF-8 文本: {value!r}"
+        ) from error
+
+
 def parse_purl(purl: object) -> tuple[str, str, str]:
     """Return (ecosystem, name, version) from a Package URL.
 
-    Percent-encoding is decoded and npm package names keep their scope.
-    Raises ValueError when the purl is missing, malformed, unsupported or
+    Percent-encoding is decoded strictly — every ``%`` must introduce two
+    hexadecimal digits and the decoded bytes must be valid UTF-8 — and npm
+    package names keep their scope. Raises ValueError when the purl is
+    missing, malformed, unsupported, carries broken percent-encoding or
     carries no version.
     """
     if not isinstance(purl, str) or not purl:
@@ -449,7 +487,7 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     if "/" not in rest:
         raise ValueError("purl 格式无效")
     raw_type, path = rest.split("/", 1)
-    ecosystem = unquote(raw_type).lower()
+    ecosystem = _decode_percent_escapes(raw_type, "purl 类型").lower()
     if ecosystem not in SUPPORTED_ECOSYSTEMS:
         raise ValueError(f"不支持的包类型: {ecosystem}")
     # Strip qualifiers (?...) and subpath (#...).
@@ -457,10 +495,14 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     if "@" not in path:
         raise ValueError("purl 缺少版本")
     name_part, version = path.rsplit("@", 1)
-    version = unquote(version)
+    version = _decode_percent_escapes(version, "purl 版本")
     if not version:
         raise ValueError("purl 版本为空")
-    segments = [unquote(segment) for segment in name_part.split("/") if segment != ""]
+    segments = [
+        _decode_percent_escapes(segment, "purl 包名")
+        for segment in name_part.split("/")
+        if segment != ""
+    ]
     if ecosystem == "npm":
         if len(segments) == 1:
             name = segments[0]
