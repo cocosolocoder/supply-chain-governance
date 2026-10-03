@@ -647,6 +647,43 @@ class RiskReportTests(ExemptionFixture):
             self.catalog.risk_report(service="nope")["impact_count"], 0
         )
 
+    def test_other_service_bad_version_does_not_break_service_report(self) -> None:
+        # Give worker's same-named lib a version PEP 440 cannot parse. api's
+        # report must still build independently; worker queries still fail.
+        self.catalog.add_component("worker", "pypi", "lib", "not-a-version")
+        report = self.catalog.risk_report(service="api")
+        self.assertEqual(report["service"], "api")
+        self.assertTrue(all(
+            entry["component"]["service"] == "api"
+            for entry in report["impacts"]
+        ))
+        self.assertEqual(
+            {entry["component"]["name"] for entry in report["impacts"]},
+            {"app", "web", "lib"},
+        )
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report(service="worker")
+
+    def test_service_report_exemption_does_not_cross_services(self) -> None:
+        # An exemption on worker's same-name record never exempts api's.
+        self.request(
+            "REQ-W",
+            service="worker",
+            vulnerability="CVE-OSV",
+            source="nvd",
+        )
+        self.catalog.approve_exemption("REQ-W", "bob", "ok")
+        report = self.catalog.risk_report(service="api")
+        api_osv = self.by(report, "lib", "CVE-OSV", "nvd")
+        self.assertFalse(api_osv["exempted"])
+        self.assertIsNone(api_osv["exemption_request"])
+        worker_report = self.catalog.risk_report(service="worker")
+        worker_osv = self.by(
+            worker_report, "lib", "CVE-OSV", "nvd", service="worker"
+        )
+        self.assertTrue(worker_osv["exempted"])
+        self.assertEqual(worker_osv["exemption_request"], "REQ-W")
+
     def test_sorting_is_stable(self) -> None:
         at = "2027-01-01T00:00:00+00:00"
         first = self.catalog.risk_report(evaluated_at=at)

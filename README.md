@@ -69,6 +69,22 @@ Each impact record carries the affected component identity, the vulnerability
 id and matched name, the severity, whether the hit is direct, and the
 shortest dependency path from the component to a directly hit component.
 
+The catalog may register component versions that PEP 440 cannot parse; such a
+component only becomes a query error when an OSV record matches its package
+name and the version has to be compared. A `--service`-scoped `impact` or
+`risk-report` builds its graph from that service alone, so a bad version in
+another service neither fails the query nor mixes into the results: the
+selected service gets its complete direct and indirect impacts, and a full
+component identity still lets the target's own dependencies participate in
+matching, so transitive hits are never lost. A component within the selected
+service (including one only reached transitively) whose version cannot be
+parsed is still an error naming service, ecosystem, package and version, and
+the command exits non-zero — it is never silently skipped. A service with no
+registered components yields an empty impact list and a risk report whose
+impact and unhandled-component counts are zero with a null highest severity.
+Directory-wide queries (`summary` and unscoped `impact`/`risk-report`) keep
+the existing version-error behavior.
+
 ## SBOM imports (CycloneDX and SPDX)
 
 `import-sbom` takes a service, a source name and a JSON file. The format is

@@ -387,6 +387,109 @@ class MatchingTests(unittest.TestCase):
         self.assertIn("版本无法解析", str(context.exception))
         self.assertIn("api/pypi/flask/not-a-version", str(context.exception))
 
+    def _two_services_one_bad_version(self) -> None:
+        # api has a healthy chain app -> flask 1.0.0; worker registers the
+        # same package name with a version PEP 440 cannot parse.
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "flask", "1.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "flask", "1.0.0"
+        )
+        self.catalog.add_component("worker", "pypi", "flask", "not-a-version")
+        self.import_records([osv_record("CVE-1", versions=["1.0.0"])])
+
+    def test_other_service_bad_version_does_not_break_service_impact(self) -> None:
+        self._two_services_one_bad_version()
+        records = self.catalog.impact(service="api")
+        by_name = {record["component"]["name"]: record for record in records}
+        self.assertEqual(set(by_name), {"app", "flask"})
+        self.assertTrue(by_name["flask"]["direct"])
+        self.assertEqual(by_name["flask"]["path"], [by_name["flask"]["component"]])
+        self.assertFalse(by_name["app"]["direct"])
+        # The indirect path still runs app -> flask inside api.
+        self.assertEqual(
+            [node["name"] for node in by_name["app"]["path"]], ["app", "flask"]
+        )
+        # Same-named components of another service never leak in.
+        self.assertTrue(
+            all(node["service"] == "api" for node in by_name["app"]["path"])
+        )
+
+    def test_identity_filter_keeps_dependencies_in_matching(self) -> None:
+        self._two_services_one_bad_version()
+        records = self.catalog.impact(
+            service="api", ecosystem="pypi", name="app", version="1.0.0"
+        )
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["component"]["name"], "app")
+        self.assertFalse(record["direct"])
+        # flask is absent from the returned list but still propagates the hit.
+        self.assertEqual(
+            [node["name"] for node in record["path"]], ["app", "flask"]
+        )
+
+    def test_service_without_components_returns_empty(self) -> None:
+        self._two_services_one_bad_version()
+        self.assertEqual(self.catalog.impact(service="ghost"), [])
+        report = self.catalog.risk_report(service="ghost")
+        self.assertEqual(report["service"], "ghost")
+        self.assertEqual(report["impacts"], [])
+        self.assertEqual(report["impact_count"], 0)
+        self.assertEqual(report["unhandled_component_count"], 0)
+        self.assertIsNone(report["highest_severity"])
+
+    def test_bad_version_in_selected_service_still_raises(self) -> None:
+        self._two_services_one_bad_version()
+        with self.assertRaises(ValueError) as context:
+            self.catalog.impact(service="worker")
+        self.assertIn("版本无法解析", str(context.exception))
+        self.assertIn("worker/pypi/flask/not-a-version", str(context.exception))
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report(service="worker")
+
+    def test_bad_dependency_version_raises_even_under_identity_filter(self) -> None:
+        # The target component is healthy, but a component it depends on in the
+        # same service cannot be parsed; it must still participate and error.
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "flask", "not-a-version")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0",
+            "api", "pypi", "flask", "not-a-version",
+        )
+        self.import_records([osv_record("CVE-1", versions=["1.0.0"])])
+        with self.assertRaises(ValueError) as context:
+            self.catalog.impact(
+                service="api", ecosystem="pypi", name="app", version="1.0.0"
+            )
+        self.assertIn("api/pypi/flask/not-a-version", str(context.exception))
+
+    def test_directory_wide_queries_keep_bad_version_error(self) -> None:
+        self._two_services_one_bad_version()
+        with self.assertRaises(ValueError):
+            self.catalog.impact()
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report()
+        with self.assertRaises(ValueError):
+            self.catalog.summary()
+
+    def test_service_risk_report_excludes_other_services(self) -> None:
+        self._two_services_one_bad_version()
+        report = self.catalog.risk_report(service="api")
+        self.assertEqual(report["service"], "api")
+        self.assertEqual(
+            {entry["component"]["name"] for entry in report["impacts"]},
+            {"app", "flask"},
+        )
+        self.assertTrue(
+            all(
+                entry["component"]["service"] == "api"
+                for entry in report["impacts"]
+            )
+        )
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "medium")
+
 
 class ImportBehaviorTests(unittest.TestCase):
     def setUp(self) -> None:

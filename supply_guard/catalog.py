@@ -1264,10 +1264,19 @@ class Catalog:
                         }
         return groups
 
-    def _components_by_id(self) -> dict[int, dict[str, str]]:
-        rows = self.connection.execute(
-            "SELECT id, service, ecosystem, name, version FROM components"
-        )
+    def _components_by_id(
+        self, service: str | None = None
+    ) -> dict[int, dict[str, str]]:
+        if service is None:
+            rows = self.connection.execute(
+                "SELECT id, service, ecosystem, name, version FROM components"
+            )
+        else:
+            rows = self.connection.execute(
+                "SELECT id, service, ecosystem, name, version FROM components "
+                "WHERE service = ?",
+                (service,),
+            )
         return {
             int(row["id"]): {
                 "service": str(row["service"]),
@@ -1278,12 +1287,29 @@ class Catalog:
             for row in rows
         }
 
-    def _dependency_edges(self) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    def _dependency_edges(
+        self, service: str | None = None
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
         forward: dict[int, list[int]] = {}
         reverse: dict[int, list[int]] = {}
-        for row in self.connection.execute(
-            "SELECT dependent_id, dependency_id FROM dependencies"
-        ):
+        if service is None:
+            rows = self.connection.execute(
+                "SELECT dependent_id, dependency_id FROM dependencies"
+            )
+        else:
+            # Dependencies only ever connect components of the same service,
+            # so restricting both endpoints keeps a service-scoped graph closed.
+            rows = self.connection.execute(
+                """
+                SELECT d.dependent_id, d.dependency_id
+                FROM dependencies d
+                JOIN components c1 ON c1.id = d.dependent_id
+                JOIN components c2 ON c2.id = d.dependency_id
+                WHERE c1.service = ? AND c2.service = ?
+                """,
+                (service, service),
+            )
+        for row in rows:
             dependent = int(row["dependent_id"])
             dependency = int(row["dependency_id"])
             forward.setdefault(dependent, []).append(dependency)
@@ -1351,6 +1377,7 @@ class Catalog:
 
     def _impact_graph(
         self,
+        service: str | None = None,
     ) -> tuple[
         dict[int, dict[str, str]],
         dict[int, list[int]],
@@ -1364,9 +1391,15 @@ class Catalog:
         records are gathered into the same direct-hit groups, so a change to
         propagation or path rules applies to every vulnerability source at
         once.
+
+        When ``service`` is given, only that service's components and
+        same-service dependency edges are loaded. Components of other services
+        never reach OSV version matching then, so an unparseable version in an
+        unrelated service cannot fail a service-scoped query; a component the
+        selected service itself needs for matching is still a query error.
         """
-        components = self._components_by_id()
-        forward, reverse = self._dependency_edges()
+        components = self._components_by_id(service)
+        forward, reverse = self._dependency_edges(service)
         return components, forward, reverse, self._direct_hits(components)
 
     @staticmethod
@@ -1462,14 +1495,13 @@ class Catalog:
                     "service is required when filtering by component identity"
                 )
 
-        records = self._impact_records()
+        # Build the graph within the service scope up front, so components of
+        # other services never take part in OSV version matching or
+        # dependency propagation. A full component identity only narrows the
+        # final list; that component's own dependencies still participate, so
+        # transitive impacts on the target are never dropped.
+        records = self._impact_records(service)
 
-        if service is not None:
-            records = [
-                record
-                for record in records
-                if record["component"]["service"] == service
-            ]
         if all(value is not None for value in identity_filter):
             records = [
                 record
@@ -1482,7 +1514,7 @@ class Catalog:
         records.sort(key=_impact_sort_key)
         return records
 
-    def _impact_records(self) -> list[dict]:
+    def _impact_records(self, service: str | None = None) -> list[dict]:
         """All current impact records, unfiltered and in an unspecified order.
 
         One record per (component, vulnerability, source, matched package),
@@ -1492,8 +1524,13 @@ class Catalog:
         basis). Every group goes through the same shortest-path propagation
         and record construction, so propagation rules live in exactly one
         place.
+
+        When ``service`` is given, matching and propagation run only over that
+        service's graph; components in other services never participate, so a
+        component with an unparseable version in another service cannot make
+        this service's query fail.
         """
-        components, forward, reverse, direct_groups = self._impact_graph()
+        components, forward, reverse, direct_groups = self._impact_graph(service)
         records: list[dict] = []
 
         for (source, identifier, matched_name), terminals in direct_groups.items():
@@ -2073,16 +2110,16 @@ class Catalog:
         else:
             moment = parse_timestamp(evaluated_at, "评估时刻")
 
-        records = self._impact_records()
+        scope_service: str | None = None
         if service is not None:
-            service = service.strip()
-            if not service:
+            scope_service = service.strip()
+            if not scope_service:
                 raise ValueError("service 不能为空")
-            records = [
-                record
-                for record in records
-                if record["component"]["service"] == service
-            ]
+
+        # Build impacts within the selected service only: same-name components,
+        # dependencies and exemptions of other services never enter the report,
+        # and an unparseable version elsewhere cannot fail this service.
+        records = self._impact_records(scope_service)
 
         active = self._active_exemptions(moment)
         reported: list[dict] = []
@@ -2152,7 +2189,7 @@ class Catalog:
 
         return {
             "evaluated_at": format_timestamp(moment),
-            "service": service,
+            "service": scope_service,
             "impact_count": len(reported),
             "unhandled_component_count": len(unexempted_components),
             "highest_severity": highest,
