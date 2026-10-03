@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from collections import deque
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1158,13 +1159,21 @@ class Catalog:
             )
         return result
 
-    def _osv_direct_hits(self, components: dict[int, dict[str, str]]) -> dict[int, list[dict]]:
-        """Map directly hit component ids to their OSV hit descriptions.
+    def _osv_direct_hits(
+        self, components: dict[int, dict[str, str]]
+    ) -> dict[tuple[str, str, str], dict[int, dict]]:
+        """Group non-withdrawn OSV direct hits by (source, id, package).
 
         Components match on the normalized PyPI package name and on the
         union of explicit versions and ECOSYSTEM ranges, compared with PEP
         440. A candidate component whose version cannot be parsed is a query
         error that points out the component.
+
+        The returned shape is the common input to the dependency
+        propagation engine, shared with manual observations: each group
+        maps every directly hit component id to the hit description whose
+        data (severity, severity basis and matched version conditions) is
+        taken from that path's terminal component.
         """
         records = self._osv_records()
         if not records:
@@ -1173,7 +1182,7 @@ class Catalog:
         for record in records:
             by_package.setdefault(record["package_name"], []).append(record)
 
-        hits: dict[int, list[dict]] = {}
+        groups: dict[tuple[str, str, str], dict[int, dict]] = {}
         for component_id, component in components.items():
             if component["ecosystem"] != "pypi":
                 continue
@@ -1195,19 +1204,16 @@ class Catalog:
                     if _condition_matches(condition, version)
                 ]
                 if matched_conditions:
-                    hits.setdefault(component_id, []).append(
-                        {
-                            "source": record["source"],
-                            "id": record["id"],
-                            "package_name": normalized,
-                            "severity": record["severity"],
-                            "severity_basis": (
-                                "default" if record["severity_default"] else "declared"
-                            ),
-                            "matched_conditions": matched_conditions,
-                        }
-                    )
-        return hits
+                    groups.setdefault(
+                        (record["source"], record["id"], normalized), {}
+                    )[component_id] = {
+                        "severity": record["severity"],
+                        "severity_basis": (
+                            "default" if record["severity_default"] else "declared"
+                        ),
+                        "matched_conditions": matched_conditions,
+                    }
+        return groups
 
     def _components_by_id(self) -> dict[int, dict[str, str]]:
         rows = self.connection.execute(
@@ -1234,6 +1240,28 @@ class Catalog:
             forward.setdefault(dependent, []).append(dependency)
             reverse.setdefault(dependency, []).append(dependent)
         return forward, reverse
+
+    @staticmethod
+    def _propagation_distances(
+        sources: Iterable[int], reverse: dict[int, list[int]]
+    ) -> dict[int, int]:
+        """Multi-source BFS over reverse dependency edges.
+
+        ``distance[node]`` is the fewest dependency hops from ``node`` to
+        any directly hit source component (0 for the sources themselves).
+        One BFS therefore serves both manual observations and imported OSV
+        records. Nodes are visited once, so dependency cycles terminate and
+        no component repeats along a reconstructed path.
+        """
+        distance = {component_id: 0 for component_id in sources}
+        queue = deque(distance)
+        while queue:
+            node = queue.popleft()
+            for dependent in reverse.get(node, ()):
+                if dependent not in distance:
+                    distance[dependent] = distance[node] + 1
+                    queue.append(dependent)
+        return distance
 
     @staticmethod
     def _reconstruct_path(
@@ -1263,35 +1291,103 @@ class Catalog:
             )
         return path_ids
 
+    def _direct_hit_groups(
+        self, components: dict[int, dict[str, str]]
+    ) -> list[tuple[str, str, str | None, dict[int, dict]]]:
+        """Group every directly hit component by its vulnerability source.
+
+        Each entry is ``(vulnerability id, matched package, source,
+        terminal)`` where ``source`` is None for a manually registered
+        observation and the OSV source name otherwise, and ``terminal``
+        maps each directly hit component id to the hit description
+        (severity, severity basis and matched version conditions) observed
+        at that component. Propagation runs once per group, so manual and
+        imported observations share the exact same path and record rules.
+        """
+        groups: list[tuple[str, str, str | None, dict[int, dict]]] = []
+        observations = self.connection.execute(
+            """
+            SELECT v.id, v.component_name, v.severity
+            FROM vulnerabilities v
+            WHERE EXISTS (SELECT 1 FROM components c WHERE c.name = v.component_name)
+            ORDER BY v.id, v.component_name
+            """
+        ).fetchall()
+        for observation in observations:
+            matched_name = str(observation["component_name"])
+            detail = {
+                "severity": str(observation["severity"]),
+                "severity_basis": None,
+                "matched_conditions": None,
+            }
+            terminal = {
+                component_id: detail
+                for component_id, component in components.items()
+                if component["name"] == matched_name
+            }
+            groups.append((str(observation["id"]), matched_name, None, terminal))
+
+        for (source, identifier, package_name), terminal in (
+            self._osv_direct_hits(components).items()
+        ):
+            groups.append((identifier, package_name, source, terminal))
+        return groups
+
+    def _propagated_records(
+        self,
+        vulnerability: str,
+        matched_name: str,
+        source: str | None,
+        terminal: dict[int, dict],
+        components: dict[int, dict[str, str]],
+        forward: dict[int, list[int]],
+        reverse: dict[int, list[int]],
+    ) -> list[dict]:
+        """Build one impact record per component reachable from one hit group.
+
+        A component reached by several routes gets one record: the shortest
+        route wins and ties are resolved by component identity during path
+        reconstruction. The severity basis and matched conditions are read
+        from the directly hit component at the end of that chosen path, so
+        the explanation never mixes data from another direct hit (such as
+        another affected version of the same normalized package).
+        """
+        distance = self._propagation_distances(terminal, reverse)
+        records: list[dict] = []
+        for component_id, hops in distance.items():
+            path_ids = self._reconstruct_path(
+                component_id, distance, forward, components
+            )
+            detail = terminal[path_ids[-1]]
+            records.append(
+                {
+                    "component": dict(components[component_id]),
+                    "vulnerability": vulnerability,
+                    "source": source,
+                    "matched_name": matched_name,
+                    "severity": detail["severity"],
+                    "severity_basis": detail["severity_basis"],
+                    "direct": hops == 0,
+                    "matched_conditions": detail["matched_conditions"],
+                    "path": [dict(components[node]) for node in path_ids],
+                }
+            )
+        return records
+
     def _affected_ids(self) -> set[int]:
         """Components directly hit by a vulnerability or depending on one that is."""
         components = self._components_by_id()
-        vulnerable_names = {
-            str(row["component_name"])
-            for row in self.connection.execute(
-                "SELECT DISTINCT component_name FROM vulnerabilities"
-            )
-        }
         _, reverse = self._dependency_edges()
-        affected = {
+        sources: list[int] = [
             component_id
-            for component_id, component in components.items()
-            if component["name"] in vulnerable_names
-        }
-        affected.update(self._osv_direct_hits(components))
-        queue = deque(affected)
-        while queue:
-            node = queue.popleft()
-            for dependent in reverse.get(node, ()):
-                if dependent not in affected:
-                    affected.add(dependent)
-                    queue.append(dependent)
-        return affected
+            for _, _, _, terminal in self._direct_hit_groups(components)
+            for component_id in terminal
+        ]
+        return set(self._propagation_distances(sources, reverse))
 
     def summary(self) -> Summary:
         components = self._components_by_id()
-        affected = self._affected_ids()
-        osv_hits = self._osv_direct_hits(components)
+        groups = self._direct_hit_groups(components)
 
         row = self.connection.execute(
             """
@@ -1312,15 +1408,26 @@ class Catalog:
         # package name, and only records that actually hit a component count.
         osv_pairs: set[tuple[str, str]] = set()
         osv_severities: list[str] = []
-        for hit_list in osv_hits.values():
-            for hit in hit_list:
-                osv_pairs.add((hit["id"], hit["package_name"]))
-                osv_severities.append(hit["severity"])
+        for identifier, package_name, source, terminal in groups:
+            if source is None:
+                continue
+            osv_pairs.add((identifier, package_name))
+            osv_severities.extend(
+                detail["severity"] for detail in terminal.values()
+            )
 
         highest = row["highest_severity"]
         for severity in osv_severities:
             if highest is None or SEVERITY_RANK[severity] > SEVERITY_RANK[highest]:
                 highest = severity
+
+        _, reverse = self._dependency_edges()
+        sources = [
+            component_id
+            for _, _, _, terminal in groups
+            for component_id in terminal
+        ]
+        affected = set(self._propagation_distances(sources, reverse))
 
         return Summary(
             components=int(row["components"]),
@@ -1383,97 +1490,22 @@ class Catalog:
         """All current impact records, unfiltered and in an unspecified order.
 
         One record per (component, vulnerability, source, matched package),
-        for both manual observations and named OSV sources, with the shortest
-        dependency path to a directly hit component.
+        for both manual observations and named OSV sources. Manual and
+        imported hit groups feed the same propagation engine, which attaches
+        the shortest dependency path to a directly hit component.
         """
         components = self._components_by_id()
         forward, reverse = self._dependency_edges()
         records: list[dict] = []
-
-        observations = self.connection.execute(
-            """
-            SELECT v.id, v.component_name, v.severity
-            FROM vulnerabilities v
-            WHERE EXISTS (SELECT 1 FROM components c WHERE c.name = v.component_name)
-            ORDER BY v.id, v.component_name
-            """
-        ).fetchall()
-        for observation in observations:
-            matched_name = str(observation["component_name"])
-            sources = [
-                component_id
-                for component_id, component in components.items()
-                if component["name"] == matched_name
-            ]
-            # Multi-source BFS over reverse edges: distance = fewest dependency
-            # hops from an affected component to a directly hit one.
-            distance = {component_id: 0 for component_id in sources}
-            queue = deque(sources)
-            while queue:
-                node = queue.popleft()
-                for dependent in reverse.get(node, ()):
-                    if dependent not in distance:
-                        distance[dependent] = distance[node] + 1
-                        queue.append(dependent)
-
-            for component_id, hops in distance.items():
-                path_ids = self._reconstruct_path(
-                    component_id, distance, forward, components
+        for identifier, matched_name, source, terminal in (
+            self._direct_hit_groups(components)
+        ):
+            records.extend(
+                self._propagated_records(
+                    identifier, matched_name, source, terminal,
+                    components, forward, reverse,
                 )
-                records.append(
-                    {
-                        "component": dict(components[component_id]),
-                        "vulnerability": str(observation["id"]),
-                        "source": None,
-                        "matched_name": matched_name,
-                        "severity": str(observation["severity"]),
-                        "severity_basis": None,
-                        "direct": hops == 0,
-                        "matched_conditions": None,
-                        "path": [dict(components[node]) for node in path_ids],
-                    }
-                )
-
-        # Imported records: one impact record per (component, source, id,
-        # matched package), with the shortest dependency path, the version
-        # conditions hit at the terminal component and the severity basis.
-        osv_hits = self._osv_direct_hits(components)
-        groups: dict[tuple[str, str, str], list[tuple[int, dict]]] = {}
-        for component_id, hit_list in osv_hits.items():
-            for hit in hit_list:
-                key = (hit["source"], hit["id"], hit["package_name"])
-                groups.setdefault(key, []).append((component_id, hit))
-        for (source, identifier, package_name), entries in groups.items():
-            hit_by_component = {component_id: hit for component_id, hit in entries}
-            sources = list(hit_by_component)
-            distance = {component_id: 0 for component_id in sources}
-            queue = deque(sources)
-            while queue:
-                node = queue.popleft()
-                for dependent in reverse.get(node, ()):
-                    if dependent not in distance:
-                        distance[dependent] = distance[node] + 1
-                        queue.append(dependent)
-
-            for component_id, hops in distance.items():
-                path_ids = self._reconstruct_path(
-                    component_id, distance, forward, components
-                )
-                terminal_hit = hit_by_component[path_ids[-1]]
-                records.append(
-                    {
-                        "component": dict(components[component_id]),
-                        "vulnerability": identifier,
-                        "source": source,
-                        "matched_name": package_name,
-                        "severity": terminal_hit["severity"],
-                        "severity_basis": terminal_hit["severity_basis"],
-                        "direct": hops == 0,
-                        "matched_conditions": terminal_hit["matched_conditions"],
-                        "path": [dict(components[node]) for node in path_ids],
-                    }
-                )
-
+            )
         return records
 
     # ------------------------------------------------------------------
