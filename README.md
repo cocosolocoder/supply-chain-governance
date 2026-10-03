@@ -160,11 +160,25 @@ Request rules:
 
 - the request id, applicant, reason and timezone-aware expiry are required;
   the expiry must be later than the submission instant (naive timestamps and
-  invalid times are rejected);
+  invalid times are rejected). This rule applies only to a **first-time**
+  submission of an id — it is never used to refuse a confirmation;
 - retrying the **same id with identical content** returns the original
-  request; the same id with different content is an error;
+  request **as it stands when queried**, even when the retry reaches the
+  service at or after the expiry instant: the late retry neither fails on the
+  expiry-vs-now rule nor requires the target impact to still exist (an impact
+  removed by SBOM replacement or vulnerability withdrawal does not block
+  confirmation). If the request has meanwhile been approved, rejected or
+  revoked, the retry returns that current status, its processing information
+  and the full history — it never reappears as a fresh pending request,
+  extends the term, changes the severity captured at approval, or adds an
+  event;
+- reusing an id with different content (reason, applicant, expiry instant or
+  scope) is a conflict error, even after the old request has expired; the
+  stored request and its history are left untouched;
 - one scope may have at most one unexpired pending **or** approved request at
-  a time.
+  a time. The expired request's confirmation does not re-occupy the freed
+  scope, so a later legitimate request for that scope is kept as its own
+  record and the two coexist.
 
 Decision rules:
 

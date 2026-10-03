@@ -191,6 +191,186 @@ class RequestValidationTests(ExemptionFixture):
         self.assertFalse(by[("api", "app", "CVE-MAN", None)]["exempted"])
 
 
+class RetryAfterExpiryTests(ExemptionFixture):
+    """Confirming a saved id after its expiry instant returns that record."""
+
+    submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    expiry = "2026-02-01T00:00:00+00:00"
+    late = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+    def _request(self, request_id="REQ-1", **overrides):
+        values = dict(
+            request_id=request_id,
+            expires_at=self.expiry,
+            submitted_at=self.submitted,
+        )
+        values.update(overrides)
+        return self.request(**values)
+
+    def _confirm(self, request_id="REQ-1", **overrides):
+        # The retry happens at/after the expiry instant (same content).
+        values = dict(
+            request_id=request_id,
+            expires_at=self.expiry,
+            submitted_at=self.late,
+        )
+        values.update(overrides)
+        return self.request(**values)
+
+    def _counts(self):
+        rows = self.catalog.connection.execute(
+            "SELECT COUNT(*) FROM exemption_requests"
+        ).fetchone()[0]
+        events = self.catalog.connection.execute(
+            "SELECT COUNT(*) FROM exemption_events"
+        ).fetchone()[0]
+        return rows, events
+
+    def test_identical_retry_after_expiry_returns_stored_pending(self) -> None:
+        first = self._request()
+        second = self._confirm()
+        self.assertEqual(first, second)
+        self.assertEqual(second["status"], "pending")
+        # The late retry neither extends the term nor adds history.
+        self.assertEqual(second["expires_at"], first["expires_at"])
+        self.assertEqual(second["created_at"], first["created_at"])
+        self.assertEqual(self._counts(), (1, 1))
+
+    def test_retry_after_approval_keeps_decision_state_and_history(self) -> None:
+        self._request()
+        self.catalog.approve_exemption(
+            "REQ-1", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        before = self.catalog.get_exemption("REQ-1")
+        confirmed = self._confirm()
+        self.assertEqual(before, confirmed)
+        self.assertEqual(confirmed["status"], "approved")
+        self.assertEqual(confirmed["approver"], "bob")
+        self.assertEqual(confirmed["approved_severity"], "high")
+        self.assertEqual(
+            [e["action"] for e in confirmed["events"]],
+            ["request", "approve"],
+        )
+        self.assertEqual(self._counts(), (1, 2))
+
+    def test_retry_after_rejection_keeps_terminal_record(self) -> None:
+        self._request()
+        self.catalog.reject_exemption(
+            "REQ-1", "bob", "no",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        confirmed = self._confirm()
+        self.assertEqual(confirmed["status"], "rejected")
+        self.assertEqual(
+            [e["action"] for e in confirmed["events"]],
+            ["request", "reject"],
+        )
+        self.assertEqual(self._counts(), (1, 2))
+
+    def test_retry_after_revocation_keeps_terminal_record(self) -> None:
+        self._request()
+        self.catalog.approve_exemption(
+            "REQ-1", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.catalog.revoke_exemption(
+            "REQ-1", "carol", "rollback",
+            revoked_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+        )
+        confirmed = self._confirm()
+        self.assertEqual(confirmed["status"], "revoked")
+        self.assertEqual(confirmed["revoker"], "carol")
+        self.assertEqual(
+            [e["action"] for e in confirmed["events"]],
+            ["request", "approve", "revoke"],
+        )
+        self.assertEqual(self._counts(), (1, 3))
+
+    def test_retry_succeeds_after_impact_has_vanished(self) -> None:
+        self._request(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd"
+        )
+        # The original impact disappears (vulnerability source withdrawal).
+        self.catalog.import_osv("nvd", [])
+        confirmed = self._confirm(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd"
+        )
+        self.assertEqual(confirmed["id"], "REQ-OSV")
+        self.assertEqual(confirmed["status"], "pending")
+        self.assertEqual(self._counts(), (1, 1))
+
+    def test_confirmation_does_not_reoccupy_freed_scope(self) -> None:
+        first = self._request()
+        # The expired pending request freed its scope; a second legitimate
+        # request now occupies it.
+        second = self.request(
+            request_id="REQ-2",
+            expires_at=self.future,
+            submitted_at=self.late,
+        )
+        confirmed = self._confirm()
+        self.assertEqual(confirmed, first)
+        self.assertEqual(confirmed["status"], "pending")
+        self.assertEqual(second["id"], "REQ-2")
+        self.assertEqual(self.catalog.get_exemption("REQ-2")["status"], "pending")
+        self.assertEqual(self._counts(), (2, 2))
+
+    def test_different_content_after_expiry_conflicts_and_keeps_original(self) -> None:
+        self._request()
+        with self.assertRaises(ValueError):
+            self._confirm(reason="changed reason")
+        with self.assertRaises(ValueError):
+            self._confirm(applicant="mallory")
+        with self.assertRaises(ValueError):
+            self._confirm(expires_at="2031-01-01T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            self._confirm(name="web")
+        record = self.catalog.get_exemption("REQ-1")
+        self.assertEqual(record["reason"], "mitigated")
+        self.assertEqual(record["applicant"], "alice")
+        self.assertEqual(record["scope"]["name"], "lib")
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(len(record["events"]), 1)
+        self.assertEqual(self._counts(), (1, 1))
+
+    def test_timezone_offset_and_whitespace_equivalence_on_retry(self) -> None:
+        # 08:00+08:00 is the same instant as 00:00+00:00.
+        first = self._request(expires_at="2026-02-01T08:00:00+08:00")
+        second = self._confirm(
+            expires_at="2026-02-01T00:00:00+00:00",
+            applicant="  alice  ",
+            reason="  mitigated  ",
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(self._counts(), (1, 1))
+
+    def test_unparseable_expiry_still_rejected_for_existing_id(self) -> None:
+        self._request()
+        with self.assertRaises(ValueError):
+            self.request(request_id="REQ-1", expires_at="not-a-time")
+        with self.assertRaises(ValueError):
+            self.request(
+                request_id="REQ-1", expires_at="2026-02-01T00:00:00"
+            )
+        self.assertEqual(self.catalog.get_exemption("REQ-1")["status"], "pending")
+
+    def test_never_used_id_still_requires_future_expiry(self) -> None:
+        with self.assertRaises(ValueError):
+            self.request(
+                request_id="REQ-NEW",
+                expires_at=self.expiry,
+                submitted_at=self.late,
+            )
+        # A fresh id with a valid later expiry behaves as a first submission.
+        record = self.request(
+            request_id="REQ-NEW",
+            expires_at=self.future,
+            submitted_at=self.late,
+        )
+        self.assertEqual(record["status"], "pending")
+
+
 class DecisionTests(ExemptionFixture):
     def test_approve_records_severity_and_history(self) -> None:
         self.request()
@@ -659,6 +839,54 @@ class CliTests(unittest.TestCase):
                 "--expires-at", "2030-01-01T00:00:00",
             ])
             self.assertEqual(code, 1)
+
+    def test_cli_confirms_expired_request_with_identical_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            # Seed a request whose term has already elapsed; the CLI retry
+            # uses the real current time (later than the expiry).
+            seed = Catalog(database)
+            seed.add_component("api", "pypi", "lib", "1")
+            seed.add_vulnerability("CVE-1", "lib", "high")
+            seed.request_exemption(
+                "REQ-1", "api", "pypi", "lib", "1", "CVE-1", "lib", None,
+                "alice", "mitigated", "2026-02-01T00:00:00+00:00",
+                submitted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            seed.close()
+
+            def run(*args):
+                return main(["--database", database, *args])
+
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "lib", "1", "CVE-1", "lib",
+                    "--applicant", "alice",
+                    "--reason", "mitigated",
+                    "--expires-at", "2026-02-01T08:00:00+08:00",
+                ),
+                0,
+            )
+            check = Catalog(database)
+            record = check.get_exemption("REQ-1")
+            self.assertEqual(record["status"], "pending")
+            self.assertEqual(len(record["events"]), 1)
+            # Reusing the id with changed content is still a conflict.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "lib", "1", "CVE-1", "lib",
+                    "--applicant", "alice",
+                    "--reason", "different",
+                    "--expires-at", "2026-02-01T00:00:00+00:00",
+                ),
+                1,
+            )
+            self.assertEqual(
+                check.get_exemption("REQ-1")["reason"], "mitigated"
+            )
+            check.close()
 
 
 if __name__ == "__main__":
