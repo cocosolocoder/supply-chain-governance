@@ -1398,5 +1398,224 @@ class CliTests(unittest.TestCase):
             check.close()
 
 
+class ApprovalReconfirmAfterSourceReplacementTests(unittest.TestCase):
+    """Approval re-confirms the current impact of the request's own source.
+
+    Between submission and approval the named OSV source may be re-imported
+    and fully replaced. The approval must save the severity the replacement
+    record currently carries for the exact scope — never the severity seen
+    at submission time, and never a record from another source or the manual
+    registry that merely shares the vulnerability id and package name. When
+    the replacement no longer hits the request's target the approval must
+    fail, even if another source still affects the target with the same id.
+    """
+
+    def setUp(self) -> None:
+        self.catalog = Catalog()
+        self.catalog.add_component("api", "pypi", "lib", "1.0.0")
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        # The same vulnerability id and package exist in three distinct
+        # scopes: the named source "nvd" (low), another source "other"
+        # (critical) and a manual observation (medium).
+        self.catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-2026-1", package="lib", severity="low",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.import_osv(
+            "other",
+            [osv_record("CVE-2026-1", package="lib", severity="critical",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.add_vulnerability("CVE-2026-1", "lib", "medium")
+        self.future = "2030-01-01T00:00:00+00:00"
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def request(self, request_id="REQ-1", name="lib", **overrides):
+        values = dict(
+            request_id=request_id,
+            service="api",
+            ecosystem="pypi",
+            name=name,
+            version="1.0.0",
+            vulnerability="CVE-2026-1",
+            matched_name="lib",
+            source="nvd",
+            applicant="alice",
+            reason="accept risk",
+            expires_at=self.future,
+        )
+        values.update(overrides)
+        return self.catalog.request_exemption(**values)
+
+    def replace_nvd(self, severity="high", versions=("1.0.0",)):
+        """Fully replace the nvd source: same id and package, new content."""
+        self.catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-2026-1", package="lib", severity=severity,
+                        versions=list(versions))],
+        )
+
+    def report_entry(self, report, name, source):
+        (match,) = [
+            impact
+            for impact in report["impacts"]
+            if impact["component"]["name"] == name
+            and impact["source"] == source
+        ]
+        return match
+
+    def test_approval_saves_current_severity_of_replaced_source(self) -> None:
+        self.request()
+        # The source is fully replaced between submission and approval: same
+        # id, same matched package, still hitting lib 1.0.0, now rated high.
+        self.replace_nvd("high")
+        # The import itself adds no processing history to the request.
+        pending = self.catalog.get_exemption("REQ-1")
+        self.assertEqual(
+            [event["action"] for event in pending["events"]], ["request"]
+        )
+
+        record = self.catalog.approve_exemption(
+            "REQ-1", "bob", "controls verified"
+        )
+        self.assertEqual(record["status"], "approved")
+        # The current severity of the request's own source is saved — not
+        # the low seen at submission, not the critical/medium other scopes
+        # carry for the same id and package.
+        self.assertEqual(record["approved_severity"], "high")
+        # Component identity, source, reason and term keep the submitted
+        # values.
+        self.assertEqual(
+            record["scope"],
+            {
+                "service": "api",
+                "ecosystem": "pypi",
+                "name": "lib",
+                "version": "1.0.0",
+                "vulnerability": "CVE-2026-1",
+                "matched_name": "lib",
+                "source": "nvd",
+            },
+        )
+        self.assertEqual(record["applicant"], "alice")
+        self.assertEqual(record["reason"], "accept risk")
+        self.assertEqual(record["created_at"], pending["created_at"])
+        self.assertEqual(record["expires_at"], "2030-01-01T00:00:00.000000Z")
+        # Exactly the submission and this approval are in the history.
+        self.assertEqual(
+            [event["action"] for event in record["events"]],
+            ["request", "approve"],
+        )
+
+        report = self.catalog.risk_report(service="api")
+        self.assertEqual(report["impact_count"], 6)
+        nvd = self.report_entry(report, "lib", "nvd")
+        self.assertTrue(nvd["exempted"])
+        self.assertEqual(nvd["exemption_request"], "REQ-1")
+        self.assertEqual(nvd["severity"], "high")
+        # Same id and package under the other source and the manual registry
+        # are not exempted by this approval and stay linked to no request.
+        other = self.report_entry(report, "lib", "other")
+        self.assertFalse(other["exempted"])
+        self.assertIsNone(other["exemption_request"])
+        self.assertEqual(other["severity"], "critical")
+        manual = self.report_entry(report, "lib", None)
+        self.assertFalse(manual["exempted"])
+        self.assertIsNone(manual["exemption_request"])
+        self.assertEqual(manual["severity"], "medium")
+        # lib still carries two unexempted records and counts once; app is
+        # unexempted through every scope and counts once.
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "critical")
+
+    def test_indirect_target_approved_through_current_dependency(self) -> None:
+        # app has no direct hit; the nvd record reaches it only through its
+        # current dependency on lib.
+        self.request("REQ-APP", name="app")
+        self.replace_nvd("high")
+        record = self.catalog.approve_exemption("REQ-APP", "bob", "ok")
+        self.assertEqual(record["status"], "approved")
+        self.assertEqual(record["approved_severity"], "high")
+
+        report = self.catalog.risk_report(service="api")
+        entry = self.report_entry(report, "app", "nvd")
+        self.assertTrue(entry["exempted"])
+        self.assertEqual(entry["exemption_request"], "REQ-APP")
+        # The record stays indirect and keeps its dependency path.
+        self.assertFalse(entry["direct"])
+        self.assertEqual(
+            [node["name"] for node in entry["path"]], ["app", "lib"]
+        )
+        # The approval does not spill over to the same-id records of the
+        # other scopes on app.
+        self.assertFalse(self.report_entry(report, "app", "other")["exempted"])
+        self.assertFalse(self.report_entry(report, "app", None)["exempted"])
+        # lib (three unexempted records) and app (two left) each count once.
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "critical")
+
+    def test_approval_fails_when_replaced_source_no_longer_hits(self) -> None:
+        self.request()
+        # The replacement keeps the id and package but 1.0.0 is no longer in
+        # the affected range; the other source still hits lib with the same
+        # vulnerability id.
+        self.replace_nvd("high", versions=("2.0.0",))
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-1", "bob", "ok")
+
+        # The request is untouched: still pending, no approval data, no new
+        # processing event.
+        record = self.catalog.get_exemption("REQ-1")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approved_severity"])
+        self.assertIsNone(record["approver"])
+        self.assertIsNone(record["decided_at"])
+        self.assertIsNone(record["decision_note"])
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
+
+        report = self.catalog.risk_report(service="api")
+        # The nvd scope is gone from the report and nothing is exempted.
+        self.assertEqual(report["impact_count"], 4)
+        self.assertFalse(
+            any(impact["source"] == "nvd" for impact in report["impacts"])
+        )
+        self.assertTrue(all(not i["exempted"] for i in report["impacts"]))
+        self.assertTrue(all(
+            impact["exemption_request"] is None for impact in report["impacts"]
+        ))
+        # The other source's same-id record is still reported on its own.
+        other = self.report_entry(report, "lib", "other")
+        self.assertFalse(other["exempted"])
+        self.assertEqual(other["severity"], "critical")
+        # lib and app each keep two unexempted records and count once each.
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "critical")
+
+    def test_indirect_approval_fails_when_dependency_path_loses_hit(self) -> None:
+        # Once the replacement stops hitting lib, the nvd record no longer
+        # reaches app through its dependency either: the indirect target is
+        # gone and the approval must fail the same way.
+        self.request("REQ-APP", name="app")
+        self.replace_nvd("high", versions=("2.0.0",))
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-APP", "bob", "ok")
+        record = self.catalog.get_exemption("REQ-APP")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approved_severity"])
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
+        report = self.catalog.risk_report(service="api")
+        self.assertFalse(any(i["exempted"] for i in report["impacts"]))
+
+
 if __name__ == "__main__":
     unittest.main()
