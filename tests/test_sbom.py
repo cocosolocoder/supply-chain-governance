@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from supply_guard.catalog import Catalog, ImportResult, parse_purl
@@ -522,6 +523,326 @@ class ImportReplacementTests(unittest.TestCase):
         self.assertEqual(summary.affected_components, 2)
         records = self.catalog.impact()
         self.assertEqual(len(records), 2)
+
+
+class RemoveDependencyCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.catalog = Catalog()
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def test_removing_last_manual_edge_deletes_orphan_endpoints_immediately(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        self.catalog.add_vulnerability("CVE-1", "lib", "high")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        # The source withdraws the components and the edge; the manual
+        # registration is the only thing keeping the pair.
+        self.catalog.import_sbom("api", "src", sbom([]))
+        self.assertEqual(self.catalog.summary().components, 2)
+
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        # No second import is needed: the leftovers leave the catalog now.
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM dependencies"
+            ).fetchone()[0],
+            0,
+        )
+        summary = self.catalog.summary()
+        self.assertEqual(summary.components, 0)
+        self.assertEqual(summary.affected_components, 0)
+        self.assertEqual(self.catalog.impact(), [])
+        report = self.catalog.risk_report()
+        self.assertEqual(report["impact_count"], 0)
+        self.assertEqual(report["unhandled_component_count"], 0)
+
+    def test_endpoint_kept_by_another_source_survives_individually(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        # A second source still declares the library.
+        self.catalog.import_sbom(
+            "api", "vendor", sbom([component("lib2", "pkg:pypi/lib@1.0")])
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        self.catalog.import_sbom("api", "src", sbom([]))
+        self.catalog.add_vulnerability("CVE-1", "lib", "high")
+
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        names = [
+            r["name"]
+            for r in self.catalog.connection.execute(
+                "SELECT name FROM components WHERE service = 'api'"
+            )
+        ]
+        self.assertEqual(names, ["lib"])
+        records = self.catalog.impact()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["component"]["name"], "lib")
+        self.assertTrue(records[0]["direct"])
+        self.assertEqual(self.catalog.summary().components, 1)
+
+    def test_endpoint_of_another_manual_edge_is_kept(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                    component("other", "pkg:pypi/other@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        # other -> app and app -> lib are both manually registered.
+        self.catalog.add_dependency(
+            "api", "pypi", "other", "1.0", "api", "pypi", "app", "1.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        self.catalog.import_sbom("api", "src", sbom([]))
+
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        names = sorted(
+            r["name"]
+            for r in self.catalog.connection.execute(
+                "SELECT name FROM components WHERE service = 'api'"
+            )
+        )
+        # lib has nothing left; app is still the target of other -> app.
+        self.assertEqual(names, ["app", "other"])
+        edges = [
+            (r["dependent"], r["dependency"])
+            for r in self.catalog.connection.execute(
+                """
+                SELECT d1.name AS dependent, d2.name AS dependency
+                FROM dependencies
+                JOIN components d1 ON dependent_id = d1.id
+                JOIN components d2 ON dependency_id = d2.id
+                """
+            )
+        ]
+        self.assertEqual(edges, [("other", "app")])
+        # The remaining dependency path is still queryable end to end.
+        self.catalog.add_vulnerability("CVE-1", "app", "high")
+        by_name = {r["component"]["name"]: r for r in self.catalog.impact()}
+        self.assertEqual(sorted(by_name), ["app", "other"])
+        self.assertEqual(
+            [node["name"] for node in by_name["other"]["path"]],
+            ["other", "app"],
+        )
+
+    def test_manual_component_registration_blocks_removal(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        # Explicitly registering the app as a manual component keeps it.
+        self.catalog.add_component("api", "pypi", "app", "1.0")
+        self.catalog.import_sbom("api", "src", sbom([]))
+
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        names = sorted(
+            r["name"]
+            for r in self.catalog.connection.execute(
+                "SELECT name FROM components WHERE service = 'api'"
+            )
+        )
+        self.assertEqual(names, ["app"])
+
+    def test_endpoint_cleanup_is_scoped_by_full_identity(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        # Same package name in another service and another version of the same
+        # service must be untouched by the removal.
+        self.catalog.import_sbom(
+            "other", "src", sbom([component("lib2", "pkg:pypi/lib@1.0")])
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom([component("libv2", "pkg:pypi/lib@2.0")]),
+        )
+
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        identities = sorted(
+            (r["service"], r["ecosystem"], r["name"], r["version"])
+            for r in self.catalog.connection.execute(
+                "SELECT service, ecosystem, name, version FROM components"
+            )
+        )
+        self.assertEqual(
+            identities,
+            [
+                ("api", "pypi", "lib", "2.0"),
+                ("other", "pypi", "lib", "1.0"),
+            ],
+        )
+
+    def test_missing_target_succeeds_and_changes_nothing(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        self.catalog.import_sbom("api", "src", sbom([]))
+        before = self.catalog.connection.execute(
+            "SELECT service, ecosystem, name, version, manual FROM components "
+            "ORDER BY service, name"
+        ).fetchall()
+        # Neither edge nor endpoints exist for this pair.
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "ghost", "1.0"
+        )
+        after = self.catalog.connection.execute(
+            "SELECT service, ecosystem, name, version, manual FROM components "
+            "ORDER BY service, name"
+        ).fetchall()
+        self.assertEqual([tuple(r) for r in before], [tuple(r) for r in after])
+        # The unrelated manual-edge endpoints are not swept.
+        self.assertEqual(
+            sorted(r["name"] for r in after), ["app", "lib"]
+        )
+
+    def test_empty_identity_field_errors_without_changing_data(self) -> None:
+        self.catalog.add_component("api", "pypi", "app", "1.0")
+        self.catalog.add_component("api", "pypi", "lib", "1.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        with self.assertRaises(ValueError):
+            self.catalog.remove_dependency(
+                "api", "pypi", " ", "1.0", "api", "pypi", "lib", "1.0"
+            )
+        with self.assertRaises(ValueError):
+            self.catalog.remove_dependency(
+                "api", "pypi", "app", "1.0", "api", "pypi", "lib", " "
+            )
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM dependencies"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(self.catalog.summary().components, 2)
+
+    def test_deleting_components_keeps_vulnerability_and_exemption_data(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            sbom(
+                [
+                    component("app", "pkg:pypi/app@1.0"),
+                    component("lib", "pkg:pypi/lib@1.0"),
+                ],
+                [{"ref": "app", "dependsOn": ["lib"]}],
+            ),
+        )
+        self.catalog.add_vulnerability("CVE-1", "lib", "high")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        expires_at = datetime.now(timezone.utc) + timedelta(days=10)
+        self.catalog.request_exemption(
+            "EXM-2026-001",
+            "api", "pypi", "lib", "1.0",
+            "CVE-1", "lib", None,
+            applicant="alice",
+            reason="mitigated by egress proxy",
+            expires_at=expires_at,
+        )
+        self.catalog.import_sbom("api", "src", sbom([]))
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1.0", "api", "pypi", "lib", "1.0"
+        )
+        # The components and impact records are gone.
+        self.assertEqual(self.catalog.summary().components, 0)
+        self.assertEqual(self.catalog.impact(), [])
+        # But the vulnerability observation and the exemption with its history
+        # remain queryable by their original ids.
+        request = self.catalog.get_exemption("EXM-2026-001")
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(
+            [event["action"] for event in request["events"]], ["request"]
+        )
+        observation = self.catalog.connection.execute(
+            "SELECT id, component_name, severity FROM vulnerabilities"
+        ).fetchone()
+        self.assertEqual(
+            tuple(observation), ("CVE-1", "lib", "high")
+        )
 
 
 class ImportPersistenceTests(unittest.TestCase):

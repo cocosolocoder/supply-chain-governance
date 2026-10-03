@@ -863,6 +863,34 @@ class Catalog:
                 (dependent_id, dependency_id),
             )
 
+    def _delete_orphan_endpoints(self, candidate_ids) -> None:
+        """Delete candidate components no registration or relationship keeps.
+
+        A component stays while any of these holds: it is manually registered,
+        some SBOM source still declares it, or it is an endpoint of another
+        manually registered dependency. Each candidate is judged on its own,
+        so deleting one relationship never removes a whole component group.
+        """
+        for component_id in candidate_ids:
+            self.connection.execute(
+                """
+                DELETE FROM components
+                WHERE id = ?
+                  AND manual = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM component_sources cs
+                      WHERE cs.component_id = components.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dependencies d
+                      WHERE d.manual = 1
+                        AND (d.dependent_id = components.id
+                             OR d.dependency_id = components.id)
+                  )
+                """,
+                (component_id,),
+            )
+
     def remove_dependency(
         self,
         service: str,
@@ -889,6 +917,7 @@ class Catalog:
         dependent_id = self._component_id(*dependent)
         dependency_id = self._component_id(*dependency)
         if dependent_id is None or dependency_id is None:
+            # Nothing targeted: succeed without touching the catalog.
             return
         with self.connection:
             # Only revoke the manual registration; relationships still declared
@@ -910,6 +939,9 @@ class Catalog:
                 """,
                 (dependent_id, dependency_id),
             )
+            # Endpoints that this edge was the last reason to keep leave the
+            # catalog immediately; each end is retained or removed on its own.
+            self._delete_orphan_endpoints((dependent_id, dependency_id))
 
     def import_sbom(
         self, service: str, source_name: str, sbom: object
@@ -1045,10 +1077,7 @@ class Catalog:
                     """
                 )
             ]
-            for component_id in orphan_component_ids:
-                self.connection.execute(
-                    "DELETE FROM components WHERE id = ?", (component_id,)
-                )
+            self._delete_orphan_endpoints(orphan_component_ids)
 
         return ImportResult(
             source_components=len(identities),

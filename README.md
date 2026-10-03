@@ -35,6 +35,24 @@ python3 -m supply_guard.cli --database catalog.db add-dependency api pypi web 2.
 python3 -m supply_guard.cli --database catalog.db remove-dependency api pypi web 2.0.0 api pypi fastapi 0.115.0
 ```
 
+`remove-dependency` only revokes the relationship's **manual registration**. If
+the same relationship is still declared by any SBOM source it stays in the
+catalog and keeps participating in impact analysis; only a relationship with no
+remaining source declaration leaves the catalog. When that happens, each of
+the two endpoints is then judged on its own: a component leaves the catalog
+only when it is not manually registered, is declared by no source, and is no
+longer an endpoint of any other manual dependency. The two ends are therefore
+retained or removed independently — deleting one relationship never clears a
+whole component group — and the decision uses the full identity of service,
+ecosystem, package name and version, so identically named components in other
+services or versions are unaffected. Summaries, impact paths and the risk
+report reflect the result immediately; no further SBOM import is needed.
+Removing a component never removes vulnerability source data or exemption
+requests and their history, which stay queryable by their original ids.
+Targeting a relationship or endpoint that does not exist succeeds without
+changing the catalog (and does not sweep unrelated components); empty identity
+fields are still rejected.
+
 A vulnerability that directly hits a component also affects everything that
 depends on it, transitively. `summary` counts all directly and indirectly
 affected components, and `impact` prints the per-component explanation as

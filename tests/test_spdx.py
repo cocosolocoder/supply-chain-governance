@@ -635,6 +635,31 @@ class SpdxReplacementTests(unittest.TestCase):
         )
         self.assertEqual(self.catalog.summary().affected_components, 0)
 
+    def test_remove_manual_edge_cleans_endpoints_after_spdx_withdrawal(self) -> None:
+        self.catalog.import_sbom(
+            "api",
+            "src",
+            spdx(
+                [
+                    package("SPDXRef-app", "pkg:pypi/app@1"),
+                    package("SPDXRef-lib", "pkg:pypi/lib@1"),
+                ],
+                [relationship("SPDXRef-app", "DEPENDS_ON", "SPDXRef-lib")],
+            ),
+        )
+        self.catalog.add_vulnerability("CVE-1", "lib", "high")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        self.catalog.import_sbom("api", "src", spdx([]))
+        self.assertEqual(self.catalog.summary().components, 2)
+        self.catalog.remove_dependency(
+            "api", "pypi", "app", "1", "api", "pypi", "lib", "1"
+        )
+        self.assertEqual(self.catalog.summary().components, 0)
+        self.assertEqual(self.catalog.summary().affected_components, 0)
+        self.assertEqual(self.catalog.impact(), [])
+
 
 class SpdxCliTests(unittest.TestCase):
     def test_import_spdx_file(self) -> None:
