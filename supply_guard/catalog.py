@@ -2154,35 +2154,126 @@ class Catalog:
                 return str(record["severity"])
         return None
 
-    def _active_exemptions(self, at: datetime) -> dict[tuple, dict]:
-        """Approved, unexpired exemptions keyed by scope, evaluated at ``at``.
+    @staticmethod
+    def _request_scope(row: sqlite3.Row) -> tuple:
+        return (
+            str(row["service"]), str(row["ecosystem"]),
+            str(row["name"]), str(row["version"]),
+            str(row["vulnerability"]), str(row["matched_name"]),
+            None if row["source"] is None else str(row["source"]),
+        )
 
-        The exemption stops at the expiry instant itself. Directory and
-        approval state are taken at the current moment; ``at`` only decides
-        whether the term is in force.
+    @staticmethod
+    def _inactive_link_reason(
+        status: str, expires_at: str, at_text: str
+    ) -> str:
+        """Why the newest request of a scope is not currently in force.
+
+        Approved-and-unexpired scopes never reach this function; their effect
+        depends on the live severity and is decided while the report is built.
         """
-        at_text = format_timestamp(at)
-        rows = self.connection.execute(
-            """
-            SELECT * FROM exemption_requests
-            WHERE status = ? AND expires_at > ?
-            """,
-            (EXEMPTION_APPROVED, at_text),
-        ).fetchall()
-        result: dict[tuple, dict] = {}
-        for row in rows:
-            scope = (
-                str(row["service"]), str(row["ecosystem"]),
-                str(row["name"]), str(row["version"]),
-                str(row["vulnerability"]), str(row["matched_name"]),
-                None if row["source"] is None else str(row["source"]),
+        if status == EXEMPTION_PENDING:
+            if expires_at <= at_text:
+                return f"申请已于 {expires_at} 到期，未获审批"
+            return "豁免申请尚在待审批"
+        if status == EXEMPTION_REJECTED:
+            return "豁免申请已被拒绝"
+        if status == EXEMPTION_REVOKED:
+            return "豁免已被撤销"
+        # An approved request that is not in force can only have expired.
+        return f"豁免已于 {expires_at} 到期"
+
+    def _scope_exemption_links(
+        self, moment: datetime, service: str | None = None
+    ) -> tuple[dict[tuple, dict], dict[tuple, dict]]:
+        """Load, in one read, both exemption views the report links against.
+
+        The report used to first fetch every approved-unexpired request and
+        then issue another scope lookup for each record without an active
+        exemption, so the number of reads grew with the number of output
+        records. Every relevant request is now read once here and grouped
+        into the two maps the old precedence used:
+
+        * ``active`` — an approved request whose term is in force at
+          ``moment`` (the exemption still stops at the expiry instant). When
+          several rows qualify for one scope — possible only at a past
+          evaluation instant, since a later request cannot be submitted
+          until the earlier term has lapsed — the last inserted row wins,
+          matching the old unordered scan that overwrote per scope. Whether
+          it covers the record is still decided against the current
+          severity while the report is built.
+        * ``latest`` — the newest request of the scope by the documented
+          selection order (submission time newest first, id largest first on
+          ties), used only when no approval is in force, together with the
+          reason it is not currently covering the record.
+
+        Directory and approval state are always taken at the current moment;
+        ``moment`` only judges the term. Rows are confined to ``service``
+        when the report is service-scoped; other services' scopes could not
+        match the report anyway, but keeping them out also prevents their
+        data from being read.
+        """
+        if service is None:
+            rows = self.connection.execute(
+                """
+                SELECT rowid AS rid, id, service, ecosystem, name, version,
+                       vulnerability, matched_name, source, status,
+                       expires_at, approved_severity
+                FROM exemption_requests
+                ORDER BY created_at DESC, id DESC
+                """
             )
-            result[scope] = {
-                "id": str(row["id"]),
-                "approved_severity": str(row["approved_severity"]),
-                "expires_at": str(row["expires_at"]),
-            }
-        return result
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT rowid AS rid, id, service, ecosystem, name, version,
+                       vulnerability, matched_name, source, status,
+                       expires_at, approved_severity
+                FROM exemption_requests
+                WHERE service = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (service,),
+            )
+        at_text = format_timestamp(moment)
+        latest: dict[tuple, dict] = {}
+        active: dict[tuple, dict] = {}
+        for row in rows:
+            scope = self._request_scope(row)
+            status = str(row["status"])
+            expires_at = str(row["expires_at"])
+            # Rows arrive newest first, so the first seen per scope is the
+            # documented "latest request" selection; later rows are ignored.
+            if scope not in latest:
+                latest[scope] = {
+                    "id": str(row["id"]),
+                    "status": status,
+                    "expires_at": expires_at,
+                    "approved_severity": (
+                        None
+                        if row["approved_severity"] is None
+                        else str(row["approved_severity"])
+                    ),
+                    "not_exempt_reason": (
+                        None
+                        if status == EXEMPTION_APPROVED and expires_at > at_text
+                        else self._inactive_link_reason(
+                            status, expires_at, at_text
+                        )
+                    ),
+                }
+            if status == EXEMPTION_APPROVED and expires_at > at_text:
+                candidate = active.get(scope)
+                # The old full-table scan saw rows in insertion order and the
+                # last inserted approved-unexpired row survived; rowid keeps
+                # that choice explicit and deterministic.
+                if candidate is None or int(row["rid"]) > candidate["rid"]:
+                    active[scope] = {
+                        "rid": int(row["rid"]),
+                        "id": str(row["id"]),
+                        "approved_severity": str(row["approved_severity"]),
+                    }
+        return active, latest
 
     def risk_report(
         self,
@@ -2217,7 +2308,10 @@ class Catalog:
         # and an unparseable version elsewhere cannot fail this service.
         records = self._impact_records(scope_service)
 
-        active = self._active_exemptions(moment)
+        # Every exemption request is read once up front (scoped to the
+        # selected service, exactly like the impact graph), so request data
+        # is no longer queried once per output record.
+        active, latest = self._scope_exemption_links(moment, scope_service)
         reported: list[dict] = []
         unexempted_components: set[tuple] = set()
         highest: str | None = None
@@ -2251,7 +2345,9 @@ class Catalog:
                 approved_rank = SEVERITY_RANK[exemption["approved_severity"]]
                 if SEVERITY_RANK[current_severity] > approved_rank:
                     # The current rating exceeds what was approved: the
-                    # exemption no longer covers this record.
+                    # exemption no longer covers this record, but the
+                    # approval id stays linked instead of falling back to
+                    # "no request".
                     entry["exemption_request"] = exemption["id"]
                     entry["not_exempt_reason"] = (
                         f"当前风险等级 {current_severity} 高于审批时的"
@@ -2261,10 +2357,13 @@ class Catalog:
                     entry["exempted"] = True
                     entry["exemption_request"] = exemption["id"]
             else:
-                linked = self._scope_request_link(scope, moment)
+                # No approval is in force for the scope: keep linking the
+                # newest request (with its pending/rejected/revoked/expired
+                # reason); an empty map entry still means no request exists.
+                linked = latest.get(scope)
                 if linked is not None:
                     entry["exemption_request"] = linked["id"]
-                    entry["not_exempt_reason"] = linked["reason"]
+                    entry["not_exempt_reason"] = linked["not_exempt_reason"]
 
             if not entry["exempted"]:
                 unexempted_components.add(
@@ -2291,44 +2390,6 @@ class Catalog:
             "highest_severity": highest,
             "impacts": reported,
         }
-
-    def _scope_request_link(self, scope: tuple, moment: datetime) -> dict | None:
-        """The most relevant request for a scope without an active exemption.
-
-        Reports why an approved exemption is not in force (expired or
-        outgrown), or the live/closed request otherwise. The newest request
-        for the scope wins.
-        """
-        rows = self.connection.execute(
-            """
-            SELECT * FROM exemption_requests
-            WHERE service = ? AND ecosystem = ? AND name = ? AND version = ?
-              AND vulnerability = ? AND matched_name = ?
-              AND ((source IS NULL AND ? IS NULL) OR source = ?)
-            ORDER BY created_at DESC, id DESC
-            """,
-            (*scope[:6], scope[6], scope[6]),
-        ).fetchall()
-        if not rows:
-            return None
-        row = rows[0]
-        status = str(row["status"])
-        at_text = format_timestamp(moment)
-        reason: str
-        if status == EXEMPTION_PENDING:
-            if str(row["expires_at"]) <= at_text:
-                reason = f"申请已于 {row['expires_at']} 到期，未获审批"
-            else:
-                reason = "豁免申请尚在待审批"
-        elif status == EXEMPTION_REJECTED:
-            reason = "豁免申请已被拒绝"
-        elif status == EXEMPTION_REVOKED:
-            reason = "豁免已被撤销"
-        elif status == EXEMPTION_APPROVED:
-            reason = f"豁免已于 {row['expires_at']} 到期"
-        else:  # pragma: no cover - every status handled above
-            reason = "豁免未生效"
-        return {"id": str(row["id"]), "reason": reason}
 
 
 def _status_label(status: str) -> str:

@@ -915,6 +915,227 @@ class RiskReportTests(ExemptionFixture):
         )
 
 
+class RequestReadBatchingTests(ExemptionFixture):
+    def request_statements_during_report(self, **report_kwargs):
+        """Count SELECTs against exemption_requests during one risk report."""
+        statements: list[str] = []
+        self.catalog.connection.set_trace_callback(
+            lambda statement: statements.append(statement)
+        )
+        self.catalog.risk_report(**report_kwargs)
+        return [
+            statement for statement in statements
+            if "exemption_requests" in statement.lower()
+        ]
+
+    def test_request_reads_do_not_grow_with_record_count(self) -> None:
+        # Many components depending on the directly hit lib produce many
+        # impact records; without any requests the old implementation issued
+        # one scope lookup per record. The batch read stays a single query.
+        for index in range(8):
+            name = f"dependent-{index}"
+            self.catalog.add_component("api", "pypi", name, "1.0.0")
+            self.catalog.add_dependency(
+                "api", "pypi", name, "1.0.0",
+                "api", "pypi", "lib", "1.0.0",
+            )
+        statements = self.request_statements_during_report()
+        self.assertEqual(len(statements), 1)
+
+        # A handful of requests for distinct scopes keeps the single read: it
+        # loads every request at once instead of looking scopes up one by one.
+        self.request("REQ-LIB")
+        self.request("REQ-D0", name="dependent-0", matched_name="lib")
+        self.request("REQ-D1", name="dependent-1", matched_name="lib")
+        statements = self.request_statements_during_report()
+        self.assertEqual(len(statements), 1)
+
+    def test_service_report_only_reads_that_service_requests(self) -> None:
+        statements = self.request_statements_during_report(service="api")
+        self.assertEqual(len(statements), 1)
+        self.assertIn("WHERE service =", statements[0])
+
+
+class NewestRequestSelectionTests(ExemptionFixture):
+    def by(self, report, name="lib", vulnerability="CVE-MAN", source=None,
+           service="api"):
+        matches = [
+            i for i in report["impacts"]
+            if i["component"]["name"] == name
+            and i["component"]["service"] == service
+            and i["vulnerability"] == vulnerability
+            and i["source"] == source
+        ]
+        (match,) = matches
+        return match
+
+    def test_rejected_then_newer_pending_links_newer(self) -> None:
+        self.request("REQ-OLD")
+        self.catalog.reject_exemption("REQ-OLD", "bob", "no")
+        self.request("REQ-NEW")
+        entry = self.by(self.catalog.risk_report())
+        self.assertEqual(entry["exemption_request"], "REQ-NEW")
+        self.assertIn("待审批", entry["not_exempt_reason"])
+
+    def test_equal_submission_time_prefers_larger_id(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.request("REQ-A", submitted_at=submitted)
+        self.catalog.reject_exemption("REQ-A", "bob", "no")
+        # The newer request shares the exact submission instant; id order is
+        # the documented tie-breaker and must not change under batching.
+        self.request("REQ-B", submitted_at=submitted)
+        entry = self.by(self.catalog.risk_report())
+        self.assertEqual(entry["exemption_request"], "REQ-B")
+        self.assertIn("待审批", entry["not_exempt_reason"])
+
+    def test_non_active_reasons_match_statuses(self) -> None:
+        # Pending expired.
+        self.request(
+            "REQ-PENDING",
+            expires_at="2026-02-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        entry = self.by(
+            self.catalog.risk_report(
+                evaluated_at="2026-02-01T00:00:00+00:00"
+            ),
+        )
+        self.assertEqual(entry["exemption_request"], "REQ-PENDING")
+        self.assertIn("到期，未获审批", entry["not_exempt_reason"])
+
+        # Rejected.
+        self.request("REQ-REJ", name="web", matched_name="lib")
+        self.catalog.reject_exemption("REQ-REJ", "bob", "no")
+        entry = self.by(self.catalog.risk_report(), name="web")
+        self.assertEqual(entry["exemption_request"], "REQ-REJ")
+        self.assertIn("已被拒绝", entry["not_exempt_reason"])
+
+        # Revoked.
+        self.request("REQ-REV", name="lib")
+        self.catalog.approve_exemption("REQ-REV", "bob", "ok")
+        self.catalog.revoke_exemption("REQ-REV", "carol", "back")
+        entry = self.by(self.catalog.risk_report(), name="lib")
+        self.assertEqual(entry["exemption_request"], "REQ-REV")
+        self.assertIn("已被撤销", entry["not_exempt_reason"])
+
+    def test_approved_expired_still_linked_with_expiry_reason(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.request(
+            "REQ-1", expires_at="2026-06-01T00:00:00+00:00",
+            submitted_at=submitted,
+        )
+        self.catalog.approve_exemption(
+            "REQ-1", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        entry = self.by(
+            self.catalog.risk_report(
+                evaluated_at="2026-06-01T00:00:00+00:00"
+            )
+        )
+        self.assertFalse(entry["exempted"])
+        self.assertEqual(entry["exemption_request"], "REQ-1")
+        self.assertIn("到期", entry["not_exempt_reason"])
+
+    def test_scope_identity_stays_exact_under_batch_read(self) -> None:
+        # Manual scope request must not link the same-id OSV record; another
+        # service's request must not link this service's record.
+        self.request("REQ-MAN")
+        self.request(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd",
+            service="worker",
+        )
+        self.catalog.approve_exemption("REQ-OSV", "bob", "ok")
+        report = self.catalog.risk_report(service="api")
+        manual = self.by(report, name="lib", vulnerability="CVE-MAN")
+        osv = self.by(report, name="lib", vulnerability="CVE-OSV",
+                      source="nvd")
+        self.assertEqual(manual["exemption_request"], "REQ-MAN")
+        self.assertIsNone(osv["exemption_request"])
+
+    def test_past_instant_with_two_approvals_uses_later_approval(self) -> None:
+        # R1 is approved and lapses; R2 is approved later for the same scope.
+        # At a past instant inside R1's term both approvals are "in force" by
+        # the term-only rule; the last-registered approval is linked, and once
+        # both terms lapse the newest id is linked as expired.
+        self.request(
+            "REQ-1",
+            expires_at="2026-02-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        self.catalog.approve_exemption(
+            "REQ-1", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.request(
+            "REQ-2",
+            expires_at="2026-06-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+        self.catalog.approve_exemption(
+            "REQ-2", "carol", "ok",
+            decided_at=datetime(2026, 3, 2, tzinfo=timezone.utc),
+        )
+        inside = self.catalog.risk_report(
+            evaluated_at="2026-01-15T00:00:00+00:00"
+        )
+        entry = self.by(inside)
+        self.assertTrue(entry["exempted"])
+        self.assertEqual(entry["exemption_request"], "REQ-2")
+
+        after_both = self.catalog.risk_report(
+            evaluated_at="2026-07-01T00:00:00+00:00"
+        )
+        entry = self.by(after_both)
+        self.assertFalse(entry["exempted"])
+        self.assertEqual(entry["exemption_request"], "REQ-2")
+        self.assertIn("到期", entry["not_exempt_reason"])
+
+    def test_revoked_new_request_does_not_shadow_in_force_approval(self) -> None:
+        # Newer request approved, then revoked; evaluated inside the older
+        # approval's term the record is still exempted via the older approval,
+        # even though the newest request of the scope is the revoked one.
+        self.request(
+            "REQ-1",
+            expires_at="2026-02-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        self.catalog.approve_exemption(
+            "REQ-1", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        self.request(
+            "REQ-2",
+            expires_at="2026-06-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+        self.catalog.approve_exemption(
+            "REQ-2", "carol", "ok",
+            decided_at=datetime(2026, 3, 2, tzinfo=timezone.utc),
+        )
+        self.catalog.revoke_exemption(
+            "REQ-2", "carol", "back",
+            revoked_at=datetime(2026, 3, 3, tzinfo=timezone.utc),
+        )
+        entry = self.by(
+            self.catalog.risk_report(
+                evaluated_at="2026-01-15T00:00:00+00:00"
+            )
+        )
+        self.assertTrue(entry["exempted"])
+        self.assertEqual(entry["exemption_request"], "REQ-1")
+        # Once the older term has lapsed too, the revoked newer request is the
+        # linked one with its revocation reason.
+        lapsed = self.by(
+            self.catalog.risk_report(
+                evaluated_at="2026-07-01T00:00:00+00:00"
+            )
+        )
+        self.assertFalse(lapsed["exempted"])
+        self.assertEqual(lapsed["exemption_request"], "REQ-2")
+        self.assertIn("已被撤销", lapsed["not_exempt_reason"])
+
+
 class PersistenceAndConcurrencyTests(unittest.TestCase):
     def test_persists_across_reopen_and_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
