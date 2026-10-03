@@ -549,6 +549,146 @@ class DecisionTests(ExemptionFixture):
         self.request(request_id="REQ-2")
 
 
+class ServiceScopedValidationTests(ExemptionFixture):
+    """The target check must see only the target service's graph.
+
+    A same-named PyPI package in another service may carry a version PEP 440
+    cannot parse; that must neither fail a request/approval for this service
+    nor be skipped inside the target service itself.
+    """
+
+    def break_worker(self) -> None:
+        # worker already ships a healthy lib 1.0.0 in the fixture; add a second
+        # version of the same package that PEP 440 cannot parse.
+        self.catalog.add_component("worker", "pypi", "lib", "not-a-version")
+
+    def test_request_survives_bad_version_in_another_service(self) -> None:
+        self.break_worker()
+        # Direct and transitive impacts, for a manual observation and an
+        # imported OSV record alike, all save a pending request with history.
+        cases = {
+            "REQ-MD": {},
+            "REQ-MI": {"name": "app", "matched_name": "lib"},
+            "REQ-OD": {"vulnerability": "CVE-OSV", "source": "nvd"},
+            "REQ-OI": {
+                "name": "app", "matched_name": "lib",
+                "vulnerability": "CVE-OSV", "source": "nvd",
+            },
+        }
+        for request_id, overrides in cases.items():
+            with self.subTest(request_id=request_id):
+                record = self.request(request_id, **overrides)
+                self.assertEqual(record["status"], "pending")
+                self.assertEqual(
+                    [event["action"] for event in record["events"]],
+                    ["request"],
+                )
+        self.assertEqual(len(self.catalog.list_exemptions()), 4)
+
+    def test_missing_target_leaves_no_record_with_bad_version_elsewhere(self) -> None:
+        self.break_worker()
+        with self.assertRaises(ValueError) as context:
+            self.request(name="ghost")
+        self.assertIn("申请目标不存在", str(context.exception))
+        # The failure is the missing target, not the other service's version,
+        # and nothing is stored.
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_approve_survives_new_bad_version_in_another_service(self) -> None:
+        # Both requests are submitted while worker is healthy...
+        self.request("REQ-MAN")
+        self.request("REQ-OSV", vulnerability="CVE-OSV", source="nvd")
+        # ...and an unparseable version appears in another service first.
+        self.break_worker()
+        manual = self.catalog.approve_exemption("REQ-MAN", "bob", "ok")
+        osv = self.catalog.approve_exemption("REQ-OSV", "carol", "ok")
+        self.assertEqual(manual["status"], "approved")
+        self.assertEqual(manual["approved_severity"], "high")
+        self.assertEqual(osv["status"], "approved")
+        self.assertEqual(osv["approved_severity"], "low")
+        self.assertEqual(
+            [event["action"] for event in osv["events"]],
+            ["request", "approve"],
+        )
+
+    def test_bad_version_in_target_service_blocks_request(self) -> None:
+        self.break_worker()
+        # worker has a healthy lib 1.0.0 the OSV record hits, but also its own
+        # unparseable version: the target service's whole graph is evaluated,
+        # so the request fails naming that component's full identity.
+        with self.assertRaises(ValueError) as context:
+            self.request("REQ-W", service="worker")
+        self.assertIn("worker/pypi/lib/not-a-version", str(context.exception))
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_bad_upstream_dependency_in_target_service_blocks_request(self) -> None:
+        catalog = Catalog()
+        catalog.add_component("api", "pypi", "app", "1.0.0")
+        catalog.add_component("api", "pypi", "lib", "not-a-version")
+        catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0",
+            "api", "pypi", "lib", "not-a-version",
+        )
+        # A healthy same-named package in another service proves the error is
+        # the target service's own dependency chain, not global matching.
+        catalog.add_component("worker", "pypi", "lib", "1.0.0")
+        catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-OSV", package="lib", severity="high",
+                        versions=["1.0.0"])],
+        )
+        try:
+            with self.assertRaises(ValueError) as context:
+                catalog.request_exemption(
+                    "REQ-1", "api", "pypi", "app", "1.0.0",
+                    "CVE-OSV", "lib", "nvd",
+                    "alice", "accept risk", self.future,
+                )
+            self.assertIn(
+                "api/pypi/lib/not-a-version", str(context.exception)
+            )
+            self.assertEqual(catalog.list_exemptions(), [])
+        finally:
+            catalog.close()
+
+    def test_approve_fails_when_target_disappeared_and_keeps_pending(self) -> None:
+        self.break_worker()
+        self.request("REQ-OSV", vulnerability="CVE-OSV", source="nvd")
+        self.catalog.import_osv("nvd", [])  # the target impact is withdrawn
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-OSV", "bob", "gone")
+        record = self.catalog.get_exemption("REQ-OSV")
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
+
+    def test_scoped_report_applies_exemption_with_bad_version_elsewhere(self) -> None:
+        self.break_worker()
+        self.request()
+        self.catalog.approve_exemption("REQ-1", "bob", "ok")
+        report = self.catalog.risk_report(service="api")
+        lib = next(
+            entry
+            for entry in report["impacts"]
+            if entry["component"]["name"] == "lib"
+            and entry["vulnerability"] == "CVE-MAN"
+        )
+        self.assertTrue(lib["exempted"])
+        self.assertEqual(lib["exemption_request"], "REQ-1")
+
+    def test_directory_wide_queries_still_fail_with_bad_version(self) -> None:
+        self.break_worker()
+        self.request()
+        self.catalog.approve_exemption("REQ-1", "bob", "ok")
+        with self.assertRaises(ValueError):
+            self.catalog.impact()
+        with self.assertRaises(ValueError):
+            self.catalog.risk_report()
+        with self.assertRaises(ValueError):
+            self.catalog.summary()
+
+
 class SeverityEscalationTests(ExemptionFixture):
     def test_exemption_stops_when_severity_outgrows_approval(self) -> None:
         self.request()
@@ -967,6 +1107,79 @@ class CliTests(unittest.TestCase):
                 record["expires_at"], "2026-02-01T00:00:00.000000Z"
             )
             self.assertEqual(len(record["events"]), 1)
+            check.close()
+
+
+    def test_cli_request_and_approve_survive_other_service_bad_version(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+
+            def run(*args):
+                return main(["--database", database, *args])
+
+            # api's app depends on lib; lib 1.0.0 is hit by an imported OSV
+            # record. worker carries the same package name at a version PEP 440
+            # cannot parse.
+            self.assertEqual(
+                run("add-component", "api", "pypi", "app", "1"), 0
+            )
+            self.assertEqual(
+                run("add-component", "api", "pypi", "lib", "1"), 0
+            )
+            self.assertEqual(
+                run("add-dependency",
+                    "api", "pypi", "app", "1",
+                    "api", "pypi", "lib", "1"),
+                0,
+            )
+            self.assertEqual(
+                run("add-component", "worker", "pypi", "lib", "not-a-version"),
+                0,
+            )
+            osv_path = Path(directory, "osv.json")
+            osv_path.write_text(
+                json.dumps([{
+                    "id": "CVE-1",
+                    "affected": [{
+                        "package": {"ecosystem": "PyPI", "name": "lib"},
+                        "versions": ["1"],
+                    }],
+                }]),
+                encoding="utf-8",
+            )
+            self.assertEqual(run("import-osv", "nvd", str(osv_path)), 0)
+
+            # Request for the transitively affected component and its approval
+            # both succeed through the CLI despite worker's bad version.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "app", "1", "CVE-1", "lib", "nvd",
+                    "--applicant", "alice", "--reason", "accept",
+                    "--expires-at", "2030-01-01T00:00:00+00:00",
+                ),
+                0,
+            )
+            self.assertEqual(
+                run("approve-exemption", "REQ-1",
+                    "--handler", "bob", "--note", "ok"),
+                0,
+            )
+            # The service-scoped report applies the exemption; the
+            # directory-wide report still fails on worker's version.
+            self.assertEqual(
+                run("risk-report", "--service", "api"), 0
+            )
+            self.assertEqual(run("risk-report"), 1)
+
+            check = Catalog(database)
+            record = check.get_exemption("REQ-1")
+            self.assertEqual(record["status"], "approved")
+            self.assertEqual(record["approved_severity"], "medium")
             check.close()
 
 

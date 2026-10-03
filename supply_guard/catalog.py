@@ -1604,8 +1604,16 @@ class Catalog:
         matched_name: str,
         source: str | None,
     ) -> bool:
-        """Whether the exact scope currently names a live impact record."""
-        for record in self._impact_records():
+        """Whether the exact scope currently names a live impact record.
+
+        Only the target service's graph is examined: a component in another
+        service never participates in matching or dependency propagation, so an
+        unparseable version elsewhere cannot block this request. The target
+        service's complete dependency graph (including components reached only
+        transitively) still participates, so an upstream component with a bad
+        version remains an error naming that component.
+        """
+        for record in self._impact_records(service):
             component = record["component"]
             if (
                 component["service"] == service
@@ -2043,8 +2051,14 @@ class Catalog:
         return self._fetch_request(request_id)
 
     def _current_scope_severity(self, scope: tuple) -> str | None:
-        """Severity of the live impact record exactly matching ``scope``."""
-        for record in self._impact_records():
+        """Severity of the live impact record exactly matching ``scope``.
+
+        The re-check runs over the target service's graph only: a bad version
+        newly added in another service cannot block the approval, while a
+        component the target service still needs for comparison (directly or
+        through its dependencies) remains an error instead of being skipped.
+        """
+        for record in self._impact_records(scope[0]):
             component = record["component"]
             if (
                 component["service"] == scope[0]

@@ -76,14 +76,19 @@ name and the version has to be compared. A `--service`-scoped `impact` or
 another service neither fails the query nor mixes into the results: the
 selected service gets its complete direct and indirect impacts, and a full
 component identity still lets the target's own dependencies participate in
-matching, so transitive hits are never lost. A component within the selected
-service (including one only reached transitively) whose version cannot be
-parsed is still an error naming service, ecosystem, package and version, and
-the command exits non-zero — it is never silently skipped. A service with no
-registered components yields an empty impact list and a risk report whose
-impact and unhandled-component counts are zero with a null highest severity.
-Directory-wide queries (`summary` and unscoped `impact`/`risk-report`) keep
-the existing version-error behavior.
+matching, so transitive hits are never lost. The same service-scoped check
+backs exemption requests and approvals: submitting for one service's impact,
+or re-confirming that impact at approval time, evaluates that service's graph
+only, so a bad version newly present in another service blocks neither. A
+component within the selected service (including one only reached through its
+dependency chain, whether by the query or by an exemption check) whose version
+cannot be parsed is still an error naming service, ecosystem, package and
+version, and the command exits non-zero — it is never silently skipped, and an
+exemption is never claimed to exist or not to exist while such a comparison is
+outstanding. A service with no registered components yields an empty impact
+list and a risk report whose impact and unhandled-component counts are zero
+with a null highest severity. Directory-wide queries (`summary` and unscoped
+`impact`/`risk-report`) keep the existing version-error behavior.
 
 ## SBOM imports (CycloneDX and SPDX)
 
@@ -148,7 +153,15 @@ name for an imported OSV record — the two are distinguished. The scope is
 exactly that record: other versions, services, sources and dependent
 components each need their own request, and exempting a directly hit library
 does **not** exempt components that depend on it. The request is refused if
-the target impact record does not currently exist.
+the target impact record does not currently exist. The existence check runs
+over the target service's graph only — including its full dependency chain, so
+an indirect (upstream) impact is judged through the service's complete
+dependencies rather than the component hitting the vulnerability on its own —
+and applies equally to manually registered vulnerabilities and imported OSV
+records. An unparseable version on a same-named component in another service
+therefore never blocks the request; one inside the target service that needs
+comparing with an OSV record still fails it and names that component's full
+identity.
 
 ```bash
 # Manual vulnerability (no trailing source)
@@ -196,10 +209,12 @@ Decision rules:
 - only pending requests can be approved/rejected; only approved, unexpired
   requests can be revoked; handler and note must be non-empty;
 - the applicant cannot approve their own request;
-- approval re-checks that the target still exists and records the severity in
-  force at that moment. If the current severity later rises above the
-  approved level, the exemption stops applying and the report flags it as out
-  of approval scope;
+- approval re-checks that the target still exists, over the same
+  service-scoped graph (so a bad version newly added to another service does
+  not block it, while an unparseable version the target service still needs to
+  compare remains an error), and records the severity in force at that moment.
+  If the current severity later rises above the approved level, the exemption
+  stops applying and the report flags it as out of approval scope;
 - deciding an expired request is an error. Empty fields, invalid timestamps,
   illegal transitions and unknown ids error out without altering the record.
 
