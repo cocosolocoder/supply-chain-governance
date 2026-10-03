@@ -519,7 +519,84 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     return ecosystem, name, version
 
 
-def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
+# A component identity: (ecosystem, name, version) taken from its purl.
+_Identity = tuple[str, str, str]
+# A dependency edge between two component identities: (dependent, dependency).
+_Edge = tuple[_Identity, _Identity]
+
+
+class _SbomGraph:
+    """Component identities and dependency edges declared by one SBOM document.
+
+    Both formats share these rules: every document reference maps to a
+    component identity; several references may declare the same identity and
+    then merge into a single catalog component; dependency edges are recorded
+    between the merged identities, each identity pair only once, so reference
+    names and document order never change the resulting catalog. Cycles
+    between distinct identities are allowed, but an edge whose endpoints
+    merge into the same identity is a self-dependency and rejects the import.
+    """
+
+    def __init__(self) -> None:
+        self.identities: dict[str, _Identity] = {}
+        self.edges: set[_Edge] = set()
+
+    def ensure_unique(self, ref: str, duplicate_error: str) -> None:
+        """References are unique within a document; duplicates are an error."""
+        if ref in self.identities:
+            raise ValueError(duplicate_error)
+
+    def register(self, ref: str, identity: _Identity) -> None:
+        """Map a document reference to its component identity.
+
+        Mapping several references to the same identity is what merges them
+        into one catalog component.
+        """
+        self.identities[ref] = identity
+
+    def identity_of(self, ref: str, unknown_error: str) -> _Identity:
+        """Resolve a document reference to its merged component identity."""
+        try:
+            return self.identities[ref]
+        except KeyError:
+            raise ValueError(unknown_error) from None
+
+    def add_edge(
+        self, dependent: _Identity, dependency: _Identity, refs: tuple[str, str]
+    ) -> None:
+        """Record a dependency between two merged identities, once.
+
+        ``refs`` are the document references the identities came from; they
+        only serve to point out the offending edge when the endpoints merge
+        into a single identity.
+        """
+        if dependent == dependency:
+            raise ValueError(f"合并后产生自依赖: {refs[0]} -> {refs[1]}")
+        self.edges.add((dependent, dependency))
+
+    def result(self) -> tuple[set[_Identity], set[_Edge]]:
+        return set(self.identities.values()), self.edges
+
+
+def _purl_identity(purl: object, context: str) -> _Identity:
+    """Parse a component's purl, reporting failures with the document position."""
+    try:
+        return parse_purl(purl)
+    except ValueError as error:
+        raise ValueError(f"{context} purl 无效: {error}") from error
+
+
+def _check_declared_version(
+    declared: object, purl_version: str, context: str
+) -> None:
+    """A version field next to the purl must agree with the purl version."""
+    if not isinstance(declared, str) or not declared:
+        raise ValueError(f"{context} 必须为非空字符串")
+    if declared != purl_version:
+        raise ValueError(f"{context} 与 purl 版本不一致")
+
+
+def _parse_sbom(sbom: object) -> tuple[set[_Identity], set[_Edge]]:
     """Validate an SBOM document and return (identities, edges).
 
     Both CycloneDX 1.5 and SPDX 2.3 JSON are accepted; the format is
@@ -535,7 +612,7 @@ def _parse_sbom(sbom: object) -> tuple[set[tuple[str, str, str]], set[tuple[tupl
     return _parse_cyclonedx(sbom)
 
 
-def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
+def _parse_cyclonedx(sbom: dict) -> tuple[set[_Identity], set[_Edge]]:
     """Validate a CycloneDX 1.5 SBOM and return (identities, edges)."""
     if sbom.get("bomFormat") != "CycloneDX":
         raise ValueError("bomFormat 必须为 CycloneDX")
@@ -556,8 +633,7 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
             if not isinstance(root_ref, str) or not root_ref:
                 raise ValueError("metadata.component.bom-ref 必须为非空字符串")
 
-    identities: dict[str, tuple[str, str, str]] = {}
-    identity_set: set[tuple[str, str, str]] = set()
+    graph = _SbomGraph()
     for index, component in enumerate(components):
         if not isinstance(component, dict):
             raise ValueError(f"components[{index}] 必须为对象")
@@ -567,32 +643,17 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
         ref = component.get("bom-ref")
         if not isinstance(ref, str) or not ref:
             raise ValueError(f"components[{index}] 的 bom-ref 必须为非空字符串")
-        if ref in identities:
-            raise ValueError(f"bom-ref 重复: {ref}")
+        graph.ensure_unique(ref, f"bom-ref 重复: {ref}")
         if root_ref is not None and ref == root_ref:
             raise ValueError(f"bom-ref 与 metadata.component 根引用冲突: {ref}")
-        purl = component.get("purl")
-        try:
-            ecosystem, name, version = parse_purl(purl)
-        except ValueError as error:
-            raise ValueError(
-                f"components[{index}] (bom-ref {ref}) purl 无效: {error}"
-            ) from error
+        context = f"components[{index}] (bom-ref {ref})"
+        identity = _purl_identity(component.get("purl"), context)
         if "version" in component:
-            version_field = component["version"]
-            if not isinstance(version_field, str) or not version_field:
-                raise ValueError(
-                    f"components[{index}] (bom-ref {ref}) version 必须为非空字符串"
-                )
-            if version_field != version:
-                raise ValueError(
-                    f"components[{index}] (bom-ref {ref}) version 与 purl 版本不一致"
-                )
-        identity = (ecosystem, name, version)
-        identities[ref] = identity
-        identity_set.add(identity)
+            _check_declared_version(
+                component["version"], identity[2], f"{context} version"
+            )
+        graph.register(ref, identity)
 
-    edges: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
     dependencies = sbom.get("dependencies", [])
     if not isinstance(dependencies, list):
         raise ValueError("dependencies 必须为数组")
@@ -608,9 +669,9 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
         if ref == root_ref:
             # The list root's own outgoing edges are not registered.
             continue
-        if ref not in identities:
-            raise ValueError(f"dependencies[{index}].ref 引用未知组件: {ref}")
-        dependent_identity = identities[ref]
+        dependent = graph.identity_of(
+            ref, f"dependencies[{index}].ref 引用未知组件: {ref}"
+        )
         for target in depends_on:
             if not isinstance(target, str) or not target:
                 raise ValueError(
@@ -620,28 +681,22 @@ def _parse_cyclonedx(sbom: dict) -> tuple[set[tuple[str, str, str]], set[tuple[t
                 raise ValueError(
                     f"dependencies[{index}] 组件 {ref} 依赖了 metadata.component 根引用"
                 )
-            if target not in identities:
-                raise ValueError(
-                    f"dependencies[{index}] 依赖引用未知组件: {target}"
-                )
-            dependency_identity = identities[target]
-            if dependent_identity == dependency_identity:
-                raise ValueError(
-                    f"合并后产生自依赖: {ref} -> {target}"
-                )
-            edges.add((dependent_identity, dependency_identity))
+            dependency = graph.identity_of(
+                target, f"dependencies[{index}] 依赖引用未知组件: {target}"
+            )
+            graph.add_edge(dependent, dependency, (ref, target))
 
-    return identity_set, edges
+    return graph.result()
 
 
-def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, str]:
+def _spdx_purl_identity(package: dict, index: int, ref: str) -> _Identity:
     """Extract a component identity from a package's purl external refs."""
     external_refs = package.get("externalRefs")
     if external_refs is None:
         raise ValueError(f"packages[{index}] (SPDXID {ref}) 缺少 purl 引用")
     if not isinstance(external_refs, list) or not external_refs:
         raise ValueError(f"packages[{index}] (SPDXID {ref}) externalRefs 必须为非空数组")
-    identity: tuple[str, str, str] | None = None
+    identity: _Identity | None = None
     for ref_index, external_ref in enumerate(external_refs):
         if not isinstance(external_ref, dict):
             raise ValueError(
@@ -649,12 +704,10 @@ def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, 
             )
         if external_ref.get("referenceType") != "purl":
             continue
-        try:
-            candidate = parse_purl(external_ref.get("referenceLocator"))
-        except ValueError as error:
-            raise ValueError(
-                f"packages[{index}] (SPDXID {ref}) purl 无效: {error}"
-            ) from error
+        candidate = _purl_identity(
+            external_ref.get("referenceLocator"),
+            f"packages[{index}] (SPDXID {ref})",
+        )
         if identity is None:
             identity = candidate
         elif candidate != identity:
@@ -666,7 +719,7 @@ def _spdx_purl_identity(package: dict, index: int, ref: str) -> tuple[str, str, 
     return identity
 
 
-def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tuple[str, str, str], tuple[str, str, str]]]]:
+def _parse_spdx(document: dict) -> tuple[set[_Identity], set[_Edge]]:
     """Validate an SPDX 2.3 JSON document and return (identities, edges)."""
     if document.get("spdxVersion") != "SPDX-2.3":
         raise ValueError("spdxVersion 必须为 SPDX-2.3")
@@ -679,8 +732,7 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
     if not isinstance(packages, list):
         raise ValueError("packages 必须为数组")
 
-    identities: dict[str, tuple[str, str, str]] = {}
-    identity_set: set[tuple[str, str, str]] = set()
+    graph = _SbomGraph()
     for index, package in enumerate(packages):
         if not isinstance(package, dict):
             raise ValueError(f"packages[{index}] 必须为对象")
@@ -689,29 +741,19 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
             raise ValueError(f"packages[{index}] SPDXID 必须为非空字符串")
         if spdxid == document_spdxid:
             raise ValueError(f"packages[{index}] SPDXID 与文档标识冲突: {spdxid}")
-        if spdxid in identities:
-            raise ValueError(f"SPDXID 重复: {spdxid}")
+        graph.ensure_unique(spdxid, f"SPDXID 重复: {spdxid}")
         identity = _spdx_purl_identity(package, index, spdxid)
         if "versionInfo" in package:
-            version_info = package["versionInfo"]
-            if not isinstance(version_info, str) or not version_info:
-                raise ValueError(
-                    f"packages[{index}] (SPDXID {spdxid}) versionInfo 必须为非空字符串"
-                )
-            if version_info != identity[2]:
-                raise ValueError(
-                    f"packages[{index}] (SPDXID {spdxid}) versionInfo 与 purl 版本不一致"
-                )
-        identities[spdxid] = identity
-        identity_set.add(identity)
+            _check_declared_version(
+                package["versionInfo"],
+                identity[2],
+                f"packages[{index}] (SPDXID {spdxid}) versionInfo",
+            )
+        graph.register(spdxid, identity)
 
-    edges: set[tuple[tuple[str, str, str], tuple[str, str, str]]] = set()
-    if "relationships" in document:
-        relationships = document["relationships"]
-        if not isinstance(relationships, list):
-            raise ValueError("relationships 必须为数组")
-    else:
-        relationships = []
+    relationships = document.get("relationships", [])
+    if not isinstance(relationships, list):
+        raise ValueError("relationships 必须为数组")
     for index, relationship in enumerate(relationships):
         if not isinstance(relationship, dict):
             raise ValueError(f"relationships[{index}] 必须为对象")
@@ -738,19 +780,15 @@ def _parse_spdx(document: dict) -> tuple[set[tuple[str, str, str]], set[tuple[tu
             raise ValueError(
                 f"relationships[{index}] 引用了文档标识而非包: {source} -> {target}"
             )
-        if source not in identities:
-            raise ValueError(f"relationships[{index}] 引用未知标识: {source}")
-        if target not in identities:
-            raise ValueError(f"relationships[{index}] 引用未知标识: {target}")
-        dependent_identity = identities[source]
-        dependency_identity = identities[target]
-        if dependent_identity == dependency_identity:
-            raise ValueError(
-                f"合并后产生自依赖: {source} -> {target}"
-            )
-        edges.add((dependent_identity, dependency_identity))
+        dependent = graph.identity_of(
+            source, f"relationships[{index}] 引用未知标识: {source}"
+        )
+        dependency = graph.identity_of(
+            target, f"relationships[{index}] 引用未知标识: {target}"
+        )
+        graph.add_edge(dependent, dependency, (source, target))
 
-    return identity_set, edges
+    return graph.result()
 
 
 class Catalog:
