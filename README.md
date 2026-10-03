@@ -161,10 +161,19 @@ Request rules:
 - the request id, applicant, reason and timezone-aware expiry are required;
   the expiry must be later than the submission instant (naive timestamps and
   invalid times are rejected);
-- retrying the **same id with identical content** returns the original
-  request; the same id with different content is an error;
+- retrying the **same id with identical content** confirms the original
+  submission and returns the stored request exactly as it stands at query
+  time — even when the retry happens at or after the expiry instant, after
+  the request was approved/rejected/revoked, or after the target impact
+  disappeared. The confirmation never extends the term, rewrites the
+  approved risk level, re-checks the current impact or adds history events;
+  the same id with any different content (scope, applicant, reason or
+  expiry) is a conflict error that leaves the stored request untouched, no
+  matter that the old request has expired;
 - one scope may have at most one unexpired pending **or** approved request at
-  a time.
+  a time. Confirming an old id does not re-occupy a scope its expiry
+  released, so the old record and a later legitimate request for that scope
+  are both kept.
 
 Decision rules:
 

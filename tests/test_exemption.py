@@ -152,7 +152,228 @@ class RequestValidationTests(ExemptionFixture):
         self.assertEqual(rows, 1)
         self.assertEqual(events, 1)
 
-    def test_same_id_different_content_rejected_and_kept(self) -> None:
+    def test_identical_retry_after_expiry_confirms_original(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-02-01T00:00:00+00:00"
+        first = self.request(expires_at=expiry, submitted_at=submitted)
+        # The retry arrives at and then after the expiry instant: the original
+        # successful submission is still confirmed, never rejected for being
+        # late.
+        for retry_at in (
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 1, tzinfo=timezone.utc),
+        ):
+            with self.subTest(retry_at=retry_at):
+                again = self.request(
+                    expires_at=expiry, submitted_at=retry_at
+                )
+                self.assertEqual(again, first)
+                self.assertEqual(again["status"], "pending")
+                self.assertEqual(again["expires_at"], first["expires_at"])
+        rows = self.catalog.connection.execute(
+            "SELECT COUNT(*) FROM exemption_requests"
+        ).fetchone()[0]
+        events = self.catalog.connection.execute(
+            "SELECT COUNT(*) FROM exemption_events"
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+        self.assertEqual(events, 1)
+
+    def test_identical_retry_accepts_equivalent_timezone_offset(self) -> None:
+        self.request(expires_at="2030-02-01T00:00:00+00:00")
+        again = self.request(expires_at="2030-02-01T08:00:00+08:00")
+        self.assertEqual(again["expires_at"], "2030-02-01T00:00:00.000000Z")
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM exemption_events"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_retry_keeps_whitespace_handling(self) -> None:
+        # Content equality follows the same stripping as a first submission.
+        self.request(reason="  mitigated  ")
+        again = self.request(reason="mitigated")
+        self.assertEqual(again["reason"], "mitigated")
+
+    def test_retry_returns_current_state_and_full_history(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-06-01T00:00:00+00:00"
+        retry_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+        # Approved (possibly since expired): state, approval info and history
+        # come back as stored; the term is not extended.
+        self.request("REQ-OK", expires_at=expiry, submitted_at=submitted)
+        self.catalog.approve_exemption(
+            "REQ-OK", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        approved = self.request(
+            "REQ-OK", expires_at=expiry, submitted_at=retry_at
+        )
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["approver"], "bob")
+        self.assertEqual(approved["approved_severity"], "high")
+        self.assertEqual(approved["expires_at"], "2026-06-01T00:00:00.000000Z")
+        self.assertEqual(
+            [event["action"] for event in approved["events"]],
+            ["request", "approve"],
+        )
+
+        # Rejected.
+        self.request("REQ-NO", name="app", matched_name="lib",
+                     expires_at=expiry, submitted_at=submitted)
+        self.catalog.reject_exemption(
+            "REQ-NO", "bob", "no",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        rejected = self.request(
+            "REQ-NO", name="app", matched_name="lib",
+            expires_at=expiry, submitted_at=retry_at,
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(len(rejected["events"]), 2)
+
+        # Revoked.
+        self.request("REQ-RV", name="web", matched_name="lib",
+                     expires_at=expiry, submitted_at=submitted)
+        self.catalog.approve_exemption(
+            "REQ-RV", "bob", "ok", decided_at=submitted
+        )
+        self.catalog.revoke_exemption(
+            "REQ-RV", "carol", "back",
+            revoked_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+        )
+        revoked = self.request(
+            "REQ-RV", name="web", matched_name="lib",
+            expires_at=expiry, submitted_at=retry_at,
+        )
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(
+            [event["action"] for event in revoked["events"]],
+            ["request", "approve", "revoke"],
+        )
+
+    def test_late_retry_does_not_recheck_target_or_risk_level(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-06-01T00:00:00+00:00"
+        retry_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        self.request(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd",
+            expires_at=expiry, submitted_at=submitted,
+        )
+        self.catalog.approve_exemption(
+            "REQ-OSV", "bob", "ok",
+            decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        # The current rating rises above the approved level and the source is
+        # then withdrawn: neither re-check runs on an id confirmation.
+        self.catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-OSV", package="lib", severity="critical",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.import_osv("nvd", [])
+        again = self.request(
+            "REQ-OSV", vulnerability="CVE-OSV", source="nvd",
+            expires_at=expiry, submitted_at=retry_at,
+        )
+        self.assertEqual(again["status"], "approved")
+        self.assertEqual(again["approved_severity"], "low")
+        self.assertEqual(len(again["events"]), 2)
+
+    def test_conflict_after_expiry_keeps_original(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-02-01T00:00:00+00:00"
+        retry_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        self.request(expires_at=expiry, submitted_at=submitted)
+        for overrides in (
+            {"reason": "changed"},
+            {"applicant": "bob"},
+            {"expires_at": "2026-03-01T00:00:00+00:00"},
+            {"name": "web"},
+            {"matched_name": "libx"},
+            {"vulnerability": "CVE-OSV", "source": "nvd"},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    self.request(submitted_at=retry_at, **overrides)
+        record = self.catalog.get_exemption("REQ-1")
+        self.assertEqual(record["reason"], "mitigated")
+        self.assertEqual(record["applicant"], "alice")
+        self.assertEqual(record["expires_at"], "2026-02-01T00:00:00.000000Z")
+        self.assertEqual(len(record["events"]), 1)
+
+    def test_manual_and_named_source_remain_distinct_on_confirm(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-02-01T00:00:00+00:00"
+        self.request(expires_at=expiry, submitted_at=submitted)
+        with self.assertRaises(ValueError):
+            # A named source where the stored request had none is different
+            # content — even though that target scope does not currently exist.
+            self.request(
+                source="nvd",
+                expires_at=expiry,
+                submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            )
+        self.assertIsNone(
+            self.catalog.get_exemption("REQ-1")["scope"]["source"]
+        )
+
+    def test_old_id_confirm_coexists_with_reused_scope(self) -> None:
+        submitted = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        expiry = "2026-02-01T00:00:00+00:00"
+        self.request(expires_at=expiry, submitted_at=submitted)
+        # The expired request releases the scope; a new, legal request takes
+        # it over.
+        later = self.request(
+            "REQ-2", expires_at="2030-01-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(later["status"], "pending")
+        # Confirming the old id neither re-occupies the scope nor collides:
+        # both records survive unchanged.
+        again = self.request(
+            expires_at=expiry,
+            submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(again["id"], "REQ-1")
+        self.assertEqual(len(again["events"]), 1)
+        ids = [
+            row["id"]
+            for row in self.catalog.connection.execute(
+                "SELECT id FROM exemption_requests ORDER BY id"
+            )
+        ]
+        self.assertEqual(ids, ["REQ-1", "REQ-2"])
+        # The live request still blocks any other brand-new id.
+        with self.assertRaises(ValueError):
+            self.request(
+                "REQ-3", expires_at="2031-01-01T00:00:00+00:00",
+            )
+
+    def test_fresh_id_rules_apply_only_to_new_ids(self) -> None:
+        # An unparseable or naive expiry is rejected even for an existing id,
+        # because parsing happens before the id is looked up.
+        self.request()
+        with self.assertRaises(ValueError):
+            self.request(expires_at="not-a-time")
+        with self.assertRaises(ValueError):
+            self.request(expires_at="2030-01-01T00:00:00")
+        # A genuinely new id keeps all first-submission requirements.
+        with self.assertRaises(ValueError):
+            self.request(
+                "NEW", name="ghost",
+                expires_at="2030-01-01T00:00:00+00:00",
+            )
+        with self.assertRaises(ValueError):
+            self.request(
+                "NEW",
+                expires_at="2026-01-01T00:00:00+00:00",
+                submitted_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+            )
+
+
         self.request()
         with self.assertRaises(ValueError):
             self.request(reason="changed reason")
@@ -659,6 +880,57 @@ class CliTests(unittest.TestCase):
                 "--expires-at", "2030-01-01T00:00:00",
             ])
             self.assertEqual(code, 1)
+
+    def test_cli_identical_retry_after_expiry_confirms(self) -> None:
+        from datetime import datetime as dt
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+
+            def run(*args):
+                return main(["--database", database, *args])
+
+            setup = Catalog(database)
+            setup.add_component("api", "pypi", "lib", "1")
+            setup.add_vulnerability("CVE-1", "lib", "high")
+            setup.request_exemption(
+                "REQ-1", "api", "pypi", "lib", "1", "CVE-1", "lib", None,
+                "alice", "mitigated", "2026-02-01T00:00:00+00:00",
+                submitted_at=dt(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            setup.close()
+
+            # The same instant expressed with a different offset, submitted
+            # well after expiry: the stored request is returned with exit 0.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "lib", "1", "CVE-1", "lib",
+                    "--applicant", "alice",
+                    "--reason", "mitigated",
+                    "--expires-at", "2026-02-01T08:00:00+08:00",
+                ),
+                0,
+            )
+            # Different content is still a conflict error.
+            self.assertEqual(
+                run(
+                    "request-exemption", "REQ-1",
+                    "api", "pypi", "lib", "1", "CVE-1", "lib",
+                    "--applicant", "alice",
+                    "--reason", "changed",
+                    "--expires-at", "2026-02-01T00:00:00+00:00",
+                ),
+                1,
+            )
+            check = Catalog(database)
+            record = check.get_exemption("REQ-1")
+            self.assertEqual(record["reason"], "mitigated")
+            self.assertEqual(
+                record["expires_at"], "2026-02-01T00:00:00.000000Z"
+            )
+            self.assertEqual(len(record["events"]), 1)
+            check.close()
 
 
 if __name__ == "__main__":

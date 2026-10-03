@@ -1603,9 +1603,15 @@ class Catalog:
         The scope is exactly (component identity, vulnerability id, matched
         package, source); ``source`` is None for a manually registered
         vulnerability and the source name for an imported OSV record. A retry
-        with the same id and identical content returns the stored request; a
-        reused id with different content is rejected. Only one live (pending or
-        unexpired approved) request may exist per scope.
+        with the same id and identical content confirms the original
+        submission and returns the stored request exactly as it currently
+        stands — its term, decision state and history are never altered, even
+        when the retry happens at or after expiry, after the request was
+        approved/rejected/revoked, or after the target impact disappeared. A
+        reused id with any different content is rejected as a conflict. Only
+        one live (pending or unexpired approved) request may exist per scope,
+        and the expiry must be later than the submission instant only for a
+        genuinely new request.
         """
         request_id = self._clean_text(request_id, "申请编号")
         service, ecosystem, name, version = self._clean_identity(
@@ -1632,8 +1638,6 @@ class Catalog:
             expiry = expiry.astimezone(timezone.utc)
         else:
             expiry = parse_timestamp(expires_at, "到期时间")
-        if expiry <= submitted_at:
-            raise ValueError("到期时间必须晚于提交时刻")
 
         scope = (
             service, ecosystem, name, version,
@@ -1644,6 +1648,13 @@ class Catalog:
                 "SELECT * FROM exemption_requests WHERE id = ?", (request_id,)
             ).fetchone()
             if existing is not None:
+                # An id names exactly one request for all time. Identical
+                # content confirms the original submission and returns the
+                # record exactly as it is now — no expiry check (the retry may
+                # run at or after expiry), no impact-existence check (the
+                # scope may have disappeared), no scope re-occupation, and no
+                # change to the term, the approved severity or the history.
+                # Any differing content is a conflict, never an overwrite.
                 stored_scope = (
                     str(existing["service"]),
                     str(existing["ecosystem"]),
@@ -1662,6 +1673,10 @@ class Catalog:
                 if not same_content:
                     raise ValueError(f"申请编号 {request_id!r} 已用于不同内容的申请")
                 return self._fetch_request(request_id)
+
+            # Everything below applies only to a genuinely new request id.
+            if expiry <= submitted_at:
+                raise ValueError("到期时间必须晚于提交时刻")
 
             if not self._impact_exists(*scope):
                 raise ValueError("申请目标不存在：当前没有匹配的漏洞影响记录")
