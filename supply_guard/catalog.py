@@ -424,6 +424,62 @@ def _impact_sort_key(record: dict) -> tuple:
     )
 
 
+# The exact target of an exemption request: the affected component identity
+# (service, ecosystem, name, version), the vulnerability id, the package name
+# the vulnerability was matched against, and the vulnerability source — None
+# for a manually registered vulnerability, the source name for an imported
+# OSV record. The seven fields identify exactly one impact record; nothing
+# else (dependency paths, name similarity, version spellings) participates.
+ScopeT = tuple[str, str, str, str, str, str, str | None]
+_SCOPE_FIELDS: tuple[str, ...] = (
+    "service", "ecosystem", "name", "version",
+    "vulnerability", "matched_name", "source",
+)
+
+
+def _scope_matches_record(scope: ScopeT, record: dict) -> bool:
+    """Whether one exemption scope names exactly this impact record.
+
+    This is the single scope-equality rule shared by request submission,
+    approval re-confirmation and report linking. Comparison is verbatim:
+    PyPI name normalization only ever matches OSV records against
+    components, it never expands a component identity or a pinned matched
+    package, so case, version spelling and similar names stay distinct. A
+    ``None`` source (manual vulnerability) never equals a named OSV source,
+    and two named sources are judged independently even when the
+    vulnerability id and package agree.
+    """
+    component = record["component"]
+    return (
+        component["service"] == scope[0]
+        and component["ecosystem"] == scope[1]
+        and component["name"] == scope[2]
+        and component["version"] == scope[3]
+        and record["vulnerability"] == scope[4]
+        and record["matched_name"] == scope[5]
+        and record["source"] == scope[6]
+    )
+
+
+def _scope_of_record(record: dict) -> ScopeT:
+    """The exemption scope that targets exactly this impact record.
+
+    The scope returned here is the same shape stored on requests and matched
+    by :func:`_scope_matches_record`, so a request's stored scope always
+    reads back identically to the scope of its corresponding report record.
+    """
+    component = record["component"]
+    return (
+        component["service"],
+        component["ecosystem"],
+        component["name"],
+        component["version"],
+        record["vulnerability"],
+        record["matched_name"],
+        record["source"],
+    )
+
+
 @dataclass(frozen=True)
 class ImportResult:
     source_components: int
@@ -1674,39 +1730,78 @@ class Catalog:
             raise ValueError(f"{context}不能为空")
         return value.strip()
 
-    def _impact_exists(
-        self,
-        service: str,
-        ecosystem: str,
-        name: str,
-        version: str,
-        vulnerability: str,
-        matched_name: str,
-        source: str | None,
-    ) -> bool:
-        """Whether the exact scope currently names a live impact record.
+    @classmethod
+    def _clean_scope(
+        cls,
+        service: object,
+        ecosystem: object,
+        name: object,
+        version: object,
+        vulnerability: object,
+        matched_name: object,
+        source: object,
+    ) -> ScopeT:
+        """Validate and trim one exemption-scope input into a canonical scope.
 
-        Matching runs only inside the target service: a component with an
-        unparseable version in another service must neither fail the
-        existence check nor be mistaken for the target. The service's full
-        dependency graph still participates, so an upstream component counts
-        as affected through its dependencies, not only on a direct hit. A
-        version that has to be compared with an OSV record inside this
-        service remains a query error (raised by the graph builder).
+        Every external entry point (request submission) builds its scope
+        here, so whitespace handling and the empty-field rules live in one
+        place. An actual ``None`` source denotes a manually registered
+        vulnerability; a provided source name is trimmed and names an OSV
+        record. The two never collapse.
         """
-        for record in self._impact_records(service):
-            component = record["component"]
-            if (
-                component["service"] == service
-                and component["ecosystem"] == ecosystem
-                and component["name"] == name
-                and component["version"] == version
-                and record["vulnerability"] == vulnerability
-                and record["matched_name"] == matched_name
-                and record["source"] == source
-            ):
-                return True
-        return False
+        service, ecosystem, name, version = cls._clean_identity(
+            service, ecosystem, name, version
+        )
+        vulnerability = cls._clean_text(vulnerability, "漏洞编号")
+        matched_name = cls._clean_text(matched_name, "匹配包名")
+        # Only an actual None denotes a manually registered vulnerability;
+        # a provided but blank or non-string source stays an input error,
+        # exactly as before — it must never silently become a manual scope.
+        source_name = (
+            None
+            if source is None
+            else cls._clean_text(source, "漏洞来源")
+        )
+        return (
+            service, ecosystem, name, version,
+            vulnerability, matched_name, source_name,
+        )
+
+    @staticmethod
+    def _scope_from_row(row: sqlite3.Row) -> ScopeT:
+        """Read the stored scope of one ``exemption_requests`` row.
+
+        Stored rows are the only other source of scopes (approval
+        re-checks, scope-occupation checks and report linking); building
+        them here keeps stored scopes identical in shape and rules to
+        freshly cleaned input scopes and to scopes of current records.
+        """
+        return tuple(
+            None if field == "source" and row[field] is None
+            else str(row[field])
+            for field in _SCOPE_FIELDS
+        )  # type: ignore[return-value]
+
+    def _current_scope_impact(self, scope: ScopeT) -> dict | None:
+        """The live impact record exactly matching ``scope``, if it exists now.
+
+        This is the one existence/equality lookup shared by submission and
+        approval: matching runs only inside the scope's target service, so a
+        component with an unparseable version in another service neither
+        fails the check nor is mistaken for the target, while the service's
+        full dependency graph still participates — an upstream component
+        reached only through dependencies counts as affected, and finding a
+        same-named record without the dependency path does not. A version
+        that has to be compared with an OSV record inside this service
+        remains a query error (raised while the graph is built); the
+        directly hit library and a component depending on it are different
+        records, a manual ``None`` source never matches a named OSV source,
+        and two named sources are judged independently.
+        """
+        for record in self._impact_records(scope[0]):
+            if _scope_matches_record(scope, record):
+                return record
+        return None
 
     def request_exemption(
         self,
@@ -1740,13 +1835,13 @@ class Catalog:
         genuinely new request.
         """
         request_id = self._clean_text(request_id, "申请编号")
-        service, ecosystem, name, version = self._clean_identity(
-            service, ecosystem, name, version
+        # The scope is assembled exactly once through the shared cleaner; the
+        # same seven-field tuple is what id confirmation, the existence
+        # check, storage and scope occupation compare.
+        scope = self._clean_scope(
+            service, ecosystem, name, version,
+            vulnerability, matched_name, source,
         )
-        vulnerability = self._clean_text(vulnerability, "漏洞编号")
-        matched_name = self._clean_text(matched_name, "匹配包名")
-        if source is not None:
-            source = self._clean_text(source, "漏洞来源")
         applicant = self._clean_text(applicant, "申请人")
         reason = self._clean_text(reason, "申请理由")
 
@@ -1765,10 +1860,6 @@ class Catalog:
         else:
             expiry = parse_timestamp(expires_at, "到期时间")
 
-        scope = (
-            service, ecosystem, name, version,
-            vulnerability, matched_name, source,
-        )
         with self._write_tx():
             existing = self.connection.execute(
                 "SELECT * FROM exemption_requests WHERE id = ?", (request_id,)
@@ -1781,17 +1872,8 @@ class Catalog:
                 # scope may have disappeared), no scope re-occupation, and no
                 # change to the term, the approved severity or the history.
                 # Any differing content is a conflict, never an overwrite.
-                stored_scope = (
-                    str(existing["service"]),
-                    str(existing["ecosystem"]),
-                    str(existing["name"]),
-                    str(existing["version"]),
-                    str(existing["vulnerability"]),
-                    str(existing["matched_name"]),
-                    None if existing["source"] is None else str(existing["source"]),
-                )
                 same_content = (
-                    stored_scope == scope
+                    self._scope_from_row(existing) == scope
                     and str(existing["applicant"]) == applicant
                     and str(existing["reason"]) == reason
                     and str(existing["expires_at"]) == format_timestamp(expiry)
@@ -1804,7 +1886,7 @@ class Catalog:
             if expiry <= submitted_at:
                 raise ValueError("到期时间必须晚于提交时刻")
 
-            if not self._impact_exists(*scope):
+            if self._current_scope_impact(scope) is None:
                 raise ValueError("申请目标不存在：当前没有匹配的漏洞影响记录")
 
             # No other live request may occupy the same scope.
@@ -1920,15 +2002,10 @@ class Catalog:
         ]
         return {
             "id": str(row["id"]),
-            "scope": {
-                "service": str(row["service"]),
-                "ecosystem": str(row["ecosystem"]),
-                "name": str(row["name"]),
-                "version": str(row["version"]),
-                "vulnerability": str(row["vulnerability"]),
-                "matched_name": str(row["matched_name"]),
-                "source": None if row["source"] is None else str(row["source"]),
-            },
+            # Projected from the canonical scope tuple, so the stored scope
+            # reads back with the same fields and values the report uses to
+            # link the request to its impact record.
+            "scope": dict(zip(_SCOPE_FIELDS, self._scope_from_row(row))),
             "applicant": str(row["applicant"]),
             "reason": str(row["reason"]),
             "created_at": str(row["created_at"]),
@@ -2008,16 +2085,16 @@ class Catalog:
             if target_status == EXEMPTION_APPROVED:
                 if handler == str(row["applicant"]):
                     raise ValueError("申请人不能批准自己的申请")
-                scope = (
-                    str(row["service"]), str(row["ecosystem"]),
-                    str(row["name"]), str(row["version"]),
-                    str(row["vulnerability"]), str(row["matched_name"]),
-                    None if row["source"] is None else str(row["source"]),
-                )
-                current_severity = self._current_scope_severity(scope)
-                if current_severity is None:
+                # Approval judges the exact stored scope against the current
+                # service graph: it must find that one impact record (via its
+                # own current dependency path), and records the severity in
+                # force now — never the submission-time level, never a
+                # same-id record from another source or a manual entry.
+                scope = self._scope_from_row(row)
+                current_impact = self._current_scope_impact(scope)
+                if current_impact is None:
                     raise ValueError("审批时目标影响记录已不存在")
-                approved_severity = current_severity
+                approved_severity = str(current_impact["severity"])
                 cursor = self.connection.execute(
                     """
                     UPDATE exemption_requests
@@ -2131,38 +2208,6 @@ class Catalog:
             )
         return self._fetch_request(request_id)
 
-    def _current_scope_severity(self, scope: tuple) -> str | None:
-        """Severity of the live impact record exactly matching ``scope``.
-
-        Re-confirmation is confined to the scope's own service, so a bad
-        version newly added to another service cannot block an approval; a
-        component within the service that still needs an OSV version
-        comparison stays an error. Returns None only when the service graph
-        builds cleanly but the target impact itself no longer exists.
-        """
-        for record in self._impact_records(scope[0]):
-            component = record["component"]
-            if (
-                component["service"] == scope[0]
-                and component["ecosystem"] == scope[1]
-                and component["name"] == scope[2]
-                and component["version"] == scope[3]
-                and record["vulnerability"] == scope[4]
-                and record["matched_name"] == scope[5]
-                and record["source"] == scope[6]
-            ):
-                return str(record["severity"])
-        return None
-
-    @staticmethod
-    def _request_scope(row: sqlite3.Row) -> tuple:
-        return (
-            str(row["service"]), str(row["ecosystem"]),
-            str(row["name"]), str(row["version"]),
-            str(row["vulnerability"]), str(row["matched_name"]),
-            None if row["source"] is None else str(row["source"]),
-        )
-
     @staticmethod
     def _inactive_link_reason(
         status: str, expires_at: str, at_text: str
@@ -2239,7 +2284,7 @@ class Catalog:
         latest: dict[tuple, dict] = {}
         active: dict[tuple, dict] = {}
         for row in rows:
-            scope = self._request_scope(row)
+            scope = self._scope_from_row(row)
             status = str(row["status"])
             expires_at = str(row["expires_at"])
             # Rows arrive newest first, so the first seen per scope is the
@@ -2318,12 +2363,11 @@ class Catalog:
 
         for record in records:
             component = record["component"]
-            scope = (
-                component["service"], component["ecosystem"],
-                component["name"], component["version"],
-                record["vulnerability"], record["matched_name"],
-                record["source"],
-            )
+            # The scope a request must carry to link to this record is built
+            # by the same constructor submission uses, so stored scopes and
+            # report records can never drift apart. Dependency paths are not
+            # part of the scope: a changed path still links the same request.
+            scope = _scope_of_record(record)
             entry = {
                 "component": dict(component),
                 "vulnerability": record["vulnerability"],

@@ -412,6 +412,104 @@ class RequestValidationTests(ExemptionFixture):
         self.assertFalse(by[("api", "app", "CVE-MAN", None)]["exempted"])
 
 
+class ScopeIdentityRuleTests(ExemptionFixture):
+    """One maintained rule for which impact record a request targets.
+
+    These pin the shared scope rule: component identity is verbatim (PEP 503
+    normalization belongs to OSV package matching only), the pinned matched
+    package name is exact, and a manual source, two named OSV sources never
+    merge even when id and package agree.
+    """
+
+    def test_component_case_is_never_normalized_into_scope(self) -> None:
+        # The registered component is lowercase lib; a differently cased name
+        # must not widen onto the same impact record.
+        for target_name, matched, source in (
+            ("LIB", "lib", None),
+            ("LIB", "lib", "nvd"),
+            ("Lib", "lib", None),
+        ):
+            with self.subTest(target=target_name, source=source):
+                with self.assertRaises(ValueError):
+                    self.request(
+                        f"REQ-{target_name}-{source}",
+                        name=target_name,
+                        vulnerability=(
+                            "CVE-OSV" if source else "CVE-MAN"
+                        ),
+                        matched_name=matched,
+                        source=source,
+                    )
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_similar_package_spellings_are_distinct_scopes(self) -> None:
+        # PEP 503-equivalent spellings only describe OSV matching; the pinned
+        # matched package must equal the record's matched_name exactly.
+        with self.assertRaises(ValueError):
+            self.request(
+                "REQ-1", vulnerability="CVE-OSV", source="nvd",
+                matched_name="LIB",
+            )
+        # ... while the exact normalized value does work.
+        record = self.request(
+            "REQ-2", vulnerability="CVE-OSV", source="nvd",
+            matched_name="lib",
+        )
+        self.assertEqual(record["scope"]["matched_name"], "lib")
+
+    def test_version_spelling_does_not_widen_scope(self) -> None:
+        with self.assertRaises(ValueError):
+            self.request(
+                "REQ-1", vulnerability="CVE-OSV", source="nvd",
+                version="1.0",
+            )
+        with self.assertRaises(ValueError):
+            self.request(version="1.0.0+local")
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_same_id_and_package_keeps_three_independent_scopes(self) -> None:
+        # nvd and ghsa carry the same id and package, and a manual entry also
+        # shares the id; each must exist, block occupation and approve on its
+        # own, and none may be borrowed as another scope's approval basis.
+        self.catalog.import_osv(
+            "ghsa",
+            [osv_record("CVE-OSV", package="lib", severity="medium",
+                        versions=["1.0.0"])],
+        )
+        self.catalog.add_vulnerability("CVE-OSV", "lib", "critical")
+
+        self.request("REQ-NVD", vulnerability="CVE-OSV", source="nvd")
+        self.request("REQ-GHSA", vulnerability="CVE-OSV", source="ghsa")
+        self.request("REQ-MAN", vulnerability="CVE-OSV", matched_name="lib")
+        self.assertEqual(len(self.catalog.list_exemptions()), 3)
+
+        # Withdrawing nvd kills only the nvd target; ghsa and the manual
+        # record keep their own scopes approvable.
+        self.catalog.import_osv("nvd", [])
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-NVD", "bob", "gone")
+        self.assertEqual(
+            self.catalog.approve_exemption(
+                "REQ-GHSA", "bob", "ok"
+            )["approved_severity"],
+            "medium",
+        )
+        self.assertEqual(
+            self.catalog.approve_exemption(
+                "REQ-MAN", "bob", "ok"
+            )["approved_severity"],
+            "critical",
+        )
+        pending = self.catalog.get_exemption("REQ-NVD")
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(len(pending["events"]), 1)
+
+    def test_provided_blank_source_never_becomes_manual(self) -> None:
+        with self.assertRaises(ValueError):
+            self.request("REQ-1", source="   ")
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+
 class ServiceScopedValidationTests(ExemptionFixture):
     """Other services' unparseable versions must not block this service.
 
