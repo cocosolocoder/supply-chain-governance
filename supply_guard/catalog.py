@@ -2090,20 +2090,24 @@ class Catalog:
             raise ValueError(f"未知申请编号: {request_id}")
         return self._request_dict(row)
 
-    def _request_dict(self, row: sqlite3.Row) -> dict:
-        events = [
-            {
-                "seq": int(event["seq"]),
-                "at": str(event["occurred_at"]),
-                "actor": str(event["actor"]),
-                "action": str(event["action"]),
-                "reason": str(event["reason"]),
-                "from_status": (
-                    None if event["from_status"] is None
-                    else str(event["from_status"])
-                ),
-                "to_status": str(event["to_status"]),
-            }
+    @staticmethod
+    def _event_dict(event: sqlite3.Row) -> dict:
+        return {
+            "seq": int(event["seq"]),
+            "at": str(event["occurred_at"]),
+            "actor": str(event["actor"]),
+            "action": str(event["action"]),
+            "reason": str(event["reason"]),
+            "from_status": (
+                None if event["from_status"] is None
+                else str(event["from_status"])
+            ),
+            "to_status": str(event["to_status"]),
+        }
+
+    def _request_events(self, request_id: str) -> list[dict]:
+        return [
+            self._event_dict(event)
             for event in self.connection.execute(
                 """
                 SELECT seq, occurred_at, actor, action, reason, from_status,
@@ -2112,9 +2116,15 @@ class Catalog:
                 WHERE request_id = ?
                 ORDER BY seq
                 """,
-                (str(row["id"]),),
+                (request_id,),
             )
         ]
+
+    def _request_dict(
+        self, row: sqlite3.Row, events: list[dict] | None = None
+    ) -> dict:
+        if events is None:
+            events = self._request_events(str(row["id"]))
         return {
             "id": str(row["id"]),
             # Projected from the canonical scope tuple, so the stored scope
@@ -2162,7 +2172,37 @@ class Catalog:
         )
         parameters: tuple = () if status is None else (status,)
         rows = self.connection.execute(query, parameters).fetchall()
-        return [self._request_dict(row) for row in rows]
+        if not rows:
+            return []
+        # One read for the history of every listed request, instead of one
+        # read per request: the events of exactly the selected requests are
+        # fetched together and grouped by request id. With a status filter
+        # the join keeps the read scoped to the selected requests only, and
+        # either way there is no bound-parameter list that grows with the
+        # number of requests returned.
+        events_query = (
+            "SELECT e.request_id, e.seq, e.occurred_at, e.actor, e.action, "
+            "e.reason, e.from_status, e.to_status "
+            "FROM exemption_events e "
+            + (
+                "JOIN exemption_requests r ON r.id = e.request_id "
+                "WHERE r.status = ? "
+                if status is not None
+                else ""
+            )
+            + "ORDER BY e.request_id, e.seq"
+        )
+        events_by_request: dict[str, list[dict]] = {}
+        for event in self.connection.execute(events_query, parameters):
+            events_by_request.setdefault(str(event["request_id"]), []).append(
+                self._event_dict(event)
+            )
+        return [
+            self._request_dict(
+                row, events_by_request.get(str(row["id"]), [])
+            )
+            for row in rows
+        ]
 
     def _process_decision(
         self,
