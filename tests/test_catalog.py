@@ -236,6 +236,100 @@ class DependencyTests(unittest.TestCase):
         )
         self.assertEqual(len(records), 1)
         self.assertEqual(len(records[0]["path"]), depth)
+        # Only the chain tail is hit directly.
+        direct = self.catalog.impact(
+            service="api",
+            ecosystem="pypi",
+            name=f"c{depth - 1}",
+            version="1.0.0",
+        )
+        self.assertEqual(len(direct), 1)
+        self.assertTrue(direct[0]["direct"])
+        self.assertEqual(
+            [node["name"] for node in direct[0]["path"]], [f"c{depth - 1}"]
+        )
+
+    def test_identity_query_memory_scales_with_graph_and_returned_path(self) -> None:
+        # A full-identity query must not materialize the paths of the other
+        # (unreturned) affected components: the old implementation built one
+        # full path per component per vulnerability group, so a 2000-node
+        # chain peaked at hundreds of MB while returning one record. A linear
+        # graph query here stays an order of magnitude below that.
+        import tracemalloc
+
+        depth = 2000
+        self.catalog.add_component("api", "pypi", "c0", "1.0.0")
+        for index in range(1, depth):
+            self.catalog.add_component("api", "pypi", f"c{index}", "1.0.0")
+            self.catalog.add_dependency(
+                "api", "pypi", f"c{index - 1}", "1.0.0",
+                "api", "pypi", f"c{index}", "1.0.0",
+            )
+        self.catalog.add_vulnerability("CVE-1", f"c{depth - 1}", "low")
+
+        tracemalloc.start()
+        records = self.catalog.impact(
+            service="api", ecosystem="pypi", name="c0", version="1.0.0"
+        )
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]["path"]), depth)
+        self.assertLess(peak, 25 * 1024 * 1024)
+
+    def test_identity_query_keeps_shortest_path_tie_and_terminal_conditions(self) -> None:
+        # Two equal-length routes end at two directly hit versions of the same
+        # normalized package; the target's single record follows the
+        # identity-smallest route and carries only that terminal's conditions.
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "x", "1.0.0")
+        self.catalog.add_component("api", "pypi", "y", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib", "2.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "x", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "x", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "y", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "y", "1.0.0", "api", "pypi", "lib", "2.0.0"
+        )
+        self.catalog.import_osv(
+            "src",
+            [
+                {
+                    "id": "CVE-1",
+                    "affected": [
+                        {
+                            "package": {"ecosystem": "PyPI", "name": "lib"},
+                            "versions": ["1.0.0", "2.0.0"],
+                        }
+                    ],
+                }
+            ],
+        )
+        (record,) = self.catalog.impact(
+            service="api", ecosystem="pypi", name="app", version="1.0.0"
+        )
+        self.assertEqual(
+            [node["name"] + node["version"] for node in record["path"]],
+            ["app1.0.0", "x1.0.0", "lib1.0.0"],
+        )
+        self.assertEqual(record["matched_conditions"], ["==1.0.0"])
+        # The directly hit terminal gets its own self-only path.
+        (terminal,) = self.catalog.impact(
+            service="api", ecosystem="pypi", name="lib", version="2.0.0"
+        )
+        self.assertTrue(terminal["direct"])
+        self.assertEqual(terminal["matched_conditions"], ["==2.0.0"])
+        self.assertEqual(
+            [node["version"] for node in terminal["path"]], ["2.0.0"]
+        )
 
     def test_cli_dependency_commands_and_errors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
