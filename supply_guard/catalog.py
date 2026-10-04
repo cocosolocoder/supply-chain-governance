@@ -1493,23 +1493,77 @@ class Catalog:
     def _propagate_distances(
         terminals: dict[int, dict],
         reverse: dict[int, list[int]],
+        bounds: frozenset[int] | set[int] | None = None,
     ) -> dict[int, int]:
         """Fewest dependency hops from each component to a directly hit one.
 
         Multi-source BFS over the reverse dependency edges starting from all
         directly hit components of one vulnerability/source/package group.
-        Cycles are handled by the distance map, so every component is
-        visited at most once and a path never repeats a component.
+        When ``bounds`` is given, only components inside it receive a
+        distance — this is the single propagation rule used by both the
+        directory/service-wide query (no bounds: every component the group
+        reaches) and the full-identity query (bounds = the target's forward
+        dependency closure). Restricting the BFS leaves every distance
+        inside the closure identical to the unbounded run. Cycles are
+        handled by the distance map, so every component is visited at most
+        once and a path never repeats a component.
         """
-        distance = {component_id: 0 for component_id in sorted(terminals)}
+        distance: dict[int, int] = {}
+        for component_id in sorted(terminals):
+            if bounds is None or component_id in bounds:
+                distance[component_id] = 0
         queue = deque(distance)
         while queue:
             node = queue.popleft()
             for dependent in reverse.get(node, ()):
+                if bounds is not None and dependent not in bounds:
+                    continue
                 if dependent not in distance:
                     distance[dependent] = distance[node] + 1
                     queue.append(dependent)
         return distance
+
+    def _impact_record(
+        self,
+        components: dict[int, dict[str, str]],
+        group_key: tuple[str | None, str, str],
+        terminals: dict[int, dict],
+        component_id: int,
+        distance: dict[int, int],
+        forward: dict[int, list[int]],
+    ) -> dict:
+        """Build the one impact record of a component within one hit group.
+
+        This is the single record-construction rule shared by the
+        directory-wide, service-scoped and full-identity queries, so the
+        direct/indirect flag, the dependency path, the source, the severity
+        and its basis and the matched version conditions can never be
+        explained differently depending on how the record was queried.
+
+        The path is reconstructed by the one shortest-path rule — fewest
+        hops to a directly hit component, ties broken stepwise by ecosystem,
+        package name and version. The severity, basis and matched
+        conditions always come from the terminal component at the end of
+        that chosen path, so when several equal-length routes lead to
+        different directly hit versions each explanation keeps its own
+        endpoint's conditions instead of mixing two routes.
+        """
+        source, identifier, matched_name = group_key
+        path_ids = self._reconstruct_path(
+            component_id, distance, forward, components
+        )
+        terminal_hit = terminals[path_ids[-1]]
+        return {
+            "component": dict(components[component_id]),
+            "vulnerability": identifier,
+            "source": source,
+            "matched_name": matched_name,
+            "severity": terminal_hit["severity"],
+            "severity_basis": terminal_hit["severity_basis"],
+            "direct": distance[component_id] == 0,
+            "matched_conditions": terminal_hit["matched_conditions"],
+            "path": [dict(components[node]) for node in path_ids],
+        }
 
     def _impact_graph(
         self,
@@ -1632,14 +1686,31 @@ class Catalog:
                 )
 
         if all(value is not None for value in identity_filter):
-            # A full identity resolves exactly one component; compute its
-            # records directly instead of building, for every vulnerability
-            # group, full distance maps and one materialized path per affected
-            # component. On a long chain that old sequence kept O(nodes^2)
-            # path data alive even though the filter returned a single record.
-            records = self._target_impact_records(
-                service, ecosystem, name, version
+            # A full identity resolves exactly one component. The graph is
+            # still built first (including OSV version matching for the whole
+            # service), so a bad version in the service fails this query even
+            # when the target does not exist; afterwards propagation is
+            # bounded by the target's forward closure and only its own paths
+            # are materialized. On a long chain this keeps memory growing
+            # with the service graph and the returned paths instead of the
+            # paths of every other affected component.
+            components, forward, reverse, direct_groups = self._impact_graph(
+                service
             )
+            target_id = self._component_id(service, ecosystem, name, version)
+            if target_id is None:
+                records = []
+            else:
+                reachable = self._forward_reachable(target_id, forward)
+                records = self._impact_records(
+                    service,
+                    target_id=target_id,
+                    reachable=reachable,
+                    components=components,
+                    forward=forward,
+                    reverse=reverse,
+                    direct_groups=direct_groups,
+                )
         else:
             # Build the graph within the service scope up front, so components
             # of other services never take part in OSV version matching or
@@ -1649,57 +1720,81 @@ class Catalog:
         records.sort(key=_impact_sort_key)
         return records
 
-    def _impact_records(self, service: str | None = None) -> list[dict]:
-        """All current impact records, unfiltered and in an unspecified order.
+    def _impact_records(
+        self,
+        service: str | None = None,
+        target_id: int | None = None,
+        reachable: frozenset[int] | set[int] | None = None,
+        components: dict[int, dict[str, str]] | None = None,
+        forward: dict[int, list[int]] | None = None,
+        reverse: dict[int, list[int]] | None = None,
+        direct_groups: dict[tuple[str | None, str, str], dict[int, dict]]
+        | None = None,
+    ) -> list[dict]:
+        """Current impact records, in an unspecified order.
 
         One record per (component, vulnerability, source, matched package),
         for both manual observations (``source`` None, no version conditions
         and no severity basis) and named OSV sources (normalized PyPI package
         match, terminal version conditions and a declared/default severity
-        basis). Every group goes through the same shortest-path propagation
-        and record construction, so propagation rules live in exactly one
-        place.
+        basis). Propagation, shortest-path selection, terminal conditions and
+        record construction run through exactly one set of rules here, so the
+        directory-wide, service-scoped and full-identity queries can never
+        explain the same component differently.
 
         When ``service`` is given, matching and propagation run only over that
         service's graph; components in other services never participate, so a
         component with an unparseable version in another service cannot make
         this service's query fail.
-        """
-        components, forward, reverse, direct_groups = self._impact_graph(service)
-        records: list[dict] = []
 
-        for (source, identifier, matched_name), terminals in direct_groups.items():
+        When ``target_id`` is given, ``reachable`` (the target's forward
+        dependency closure) bounds propagation to exactly the components the
+        target can reach, and only the target's own record per group is built.
+        Every distance and path inside the closure is computed by the same
+        rules as the unbounded run, so the returned records are identical to
+        the corresponding records of a service-wide query, while memory grows
+        with the service graph and the returned paths instead of with the
+        materialized paths of every other affected component. A preloaded
+        graph (``components``/``forward``/``reverse``/``direct_groups``) is
+        reused when supplied, so the caller can resolve the target after the
+        whole-service graph — including OSV version matching — was built.
+        """
+        if components is None:
+            components, forward, reverse, direct_groups = self._impact_graph(
+                service
+            )
+        if target_id is not None and target_id not in components:
+            return []
+
+        records: list[dict] = []
+        for group_key, terminals in direct_groups.items():
             if not terminals:
                 continue
             # Multi-source BFS over reverse edges: distance = fewest
             # dependency hops from an affected component to a directly hit
-            # one. All directly hit components of the group are distance 0,
-            # so a component reached by several paths gets one record and
-            # propagation through cycles terminates at visited nodes.
-            distance = self._propagate_distances(terminals, reverse)
-
-            for component_id in sorted(distance):
-                hops = distance[component_id]
-                path_ids = self._reconstruct_path(
-                    component_id, distance, forward, components
-                )
-                # The hit details belong to the terminal component of the
-                # chosen shortest path; with several directly hit versions of
-                # the same normalized package this keeps each path's
-                # explanation tied to its own endpoint.
-                terminal_hit = terminals[path_ids[-1]]
+            # one. All directly hit components of the group are distance 0
+            # (inside the target's closure when bounded), so a component
+            # reached by several paths gets one record and propagation
+            # through cycles terminates at visited nodes.
+            distance = self._propagate_distances(terminals, reverse, reachable)
+            if target_id is None:
+                affected_ids = sorted(distance)
+            elif target_id not in distance:
+                # No directly hit component lies downstream of the target in
+                # this group, or the target cannot reach one: no record.
+                continue
+            else:
+                affected_ids = [target_id]
+            for component_id in affected_ids:
                 records.append(
-                    {
-                        "component": dict(components[component_id]),
-                        "vulnerability": identifier,
-                        "source": source,
-                        "matched_name": matched_name,
-                        "severity": terminal_hit["severity"],
-                        "severity_basis": terminal_hit["severity_basis"],
-                        "direct": hops == 0,
-                        "matched_conditions": terminal_hit["matched_conditions"],
-                        "path": [dict(components[node]) for node in path_ids],
-                    }
+                    self._impact_record(
+                        components,
+                        group_key,
+                        terminals,
+                        component_id,
+                        distance,
+                        forward,
+                    )
                 )
 
         return records
@@ -1707,12 +1802,13 @@ class Catalog:
     @staticmethod
     def _forward_reachable(
         target_id: int, forward: dict[int, list[int]]
-    ) -> set[int]:
+    ) -> frozenset[int]:
         """All components reachable from ``target_id`` along dependency edges.
 
         The closure depends only on the graph, never on a particular
         vulnerability group, so it is computed once per full-identity query
-        and reused for every group. Cycles terminate through the visited set.
+        and reused as the propagation bound for every group. Cycles
+        terminate through the visited set.
         """
         reachable = {target_id}
         queue = deque([target_id])
@@ -1722,93 +1818,7 @@ class Catalog:
                 if dependency not in reachable:
                     reachable.add(dependency)
                     queue.append(dependency)
-        return reachable
-
-    def _target_impact_records(
-        self,
-        service: str,
-        ecosystem: str,
-        name: str,
-        version: str,
-    ) -> list[dict]:
-        """Current impact records of exactly one fully identified component.
-
-        The whole service graph is loaded and every component of the service
-        still takes part in OSV version matching, so this preserves the
-        service-wide rules exactly: an unparseable version anywhere in the
-        service (including components that are merely transitive
-        dependencies of the target) still fails the query, and hits arriving
-        through any dependency path are kept.
-
-        Unlike :meth:`_impact_records`, propagation is confined to the
-        target's forward dependency closure and only the target's own
-        shortest path is materialized per vulnerability group. Memory
-        therefore tracks the service graph plus the returned paths instead of
-        growing with the sum of the path lengths of every other affected
-        component. The hop counts and the identity-based path tie-break are
-        computed by the same BFS/reconstruction rules as the full-graph query,
-        so each returned record is identical to what filtering the full
-        service result would yield.
-        """
-        # Build the graph before checking the target: version comparison runs
-        # for the entire service regardless of whether the target exists, so
-        # a bad version in the service keeps failing this query.
-        components, forward, reverse, direct_groups = self._impact_graph(service)
-        target_id = self._component_id(service, ecosystem, name, version)
-        if target_id is None or target_id not in components:
-            return []
-
-        reachable = self._forward_reachable(target_id, forward)
-        records: list[dict] = []
-
-        for (source, identifier, matched_name), terminals in direct_groups.items():
-            if not terminals:
-                continue
-            seeds = reachable.intersection(terminals)
-            if not seeds:
-                # No directly hit component lies downstream of the target:
-                # this group cannot affect it, and no propagation is needed.
-                continue
-            # Multi-source reverse BFS confined to the target's forward
-            # closure: shortest hop count to a directly hit component, with no
-            # distance entries for components the target cannot reach.
-            distance: dict[int, int] = {component_id: 0 for component_id in seeds}
-            queue = deque(distance)
-            while queue:
-                node = queue.popleft()
-                node_distance = distance[node]
-                for dependent in reverse.get(node, ()):
-                    if dependent in reachable and dependent not in distance:
-                        distance[dependent] = node_distance + 1
-                        queue.append(dependent)
-            if target_id not in distance:
-                continue
-            hops = distance[target_id]
-            # Same reconstruction (and identity tie-break) as the full-graph
-            # query; every shorter-distance candidate sits inside the
-            # closure, so the chosen path and terminal are identical.
-            path_ids = self._reconstruct_path(
-                target_id, distance, forward, components
-            )
-            # The hit details belong to the terminal of the chosen path, so
-            # with several directly hit versions each explanation keeps its
-            # own endpoint's conditions.
-            terminal_hit = terminals[path_ids[-1]]
-            records.append(
-                {
-                    "component": dict(components[target_id]),
-                    "vulnerability": identifier,
-                    "source": source,
-                    "matched_name": matched_name,
-                    "severity": terminal_hit["severity"],
-                    "severity_basis": terminal_hit["severity_basis"],
-                    "direct": hops == 0,
-                    "matched_conditions": terminal_hit["matched_conditions"],
-                    "path": [dict(components[node]) for node in path_ids],
-                }
-            )
-
-        return records
+        return frozenset(reachable)
 
     # ------------------------------------------------------------------
     # Vulnerability exemptions
