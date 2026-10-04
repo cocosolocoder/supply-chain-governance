@@ -2090,31 +2090,46 @@ class Catalog:
             raise ValueError(f"未知申请编号: {request_id}")
         return self._request_dict(row)
 
-    def _request_dict(self, row: sqlite3.Row) -> dict:
-        events = [
-            {
-                "seq": int(event["seq"]),
-                "at": str(event["occurred_at"]),
-                "actor": str(event["actor"]),
-                "action": str(event["action"]),
-                "reason": str(event["reason"]),
-                "from_status": (
-                    None if event["from_status"] is None
-                    else str(event["from_status"])
-                ),
-                "to_status": str(event["to_status"]),
-            }
-            for event in self.connection.execute(
-                """
-                SELECT seq, occurred_at, actor, action, reason, from_status,
-                       to_status
-                FROM exemption_events
-                WHERE request_id = ?
-                ORDER BY seq
-                """,
-                (str(row["id"]),),
-            )
-        ]
+    @staticmethod
+    def _event_dict(event: sqlite3.Row) -> dict:
+        return {
+            "seq": int(event["seq"]),
+            "at": str(event["occurred_at"]),
+            "actor": str(event["actor"]),
+            "action": str(event["action"]),
+            "reason": str(event["reason"]),
+            "from_status": (
+                None if event["from_status"] is None
+                else str(event["from_status"])
+            ),
+            "to_status": str(event["to_status"]),
+        }
+
+    def _request_dict(
+        self, row: sqlite3.Row, events: list[dict] | None = None
+    ) -> dict:
+        """Build one request record, attaching its processing history.
+
+        A list query passes the history it batch-loaded for exactly this
+        request (never another request's); when no history is supplied the
+        events of this one request are read on demand, which is the path a
+        single-request fetch uses. Either way the produced record is
+        identical, so list and single views can never drift apart.
+        """
+        if events is None:
+            events = [
+                self._event_dict(event)
+                for event in self.connection.execute(
+                    """
+                    SELECT seq, occurred_at, actor, action, reason, from_status,
+                           to_status
+                    FROM exemption_events
+                    WHERE request_id = ?
+                    ORDER BY seq
+                    """,
+                    (str(row["id"]),),
+                )
+            ]
         return {
             "id": str(row["id"]),
             # Projected from the canonical scope tuple, so the stored scope
@@ -2154,7 +2169,16 @@ class Catalog:
         return self._fetch_request(request_id)
 
     def list_exemptions(self, status: str | None = None) -> list[dict]:
-        """List requests (with history), newest first, id as tiebreaker."""
+        """List requests (with history), newest first, id as tiebreaker.
+
+        Whatever the status filter (or lack of one), the requests and the
+        complete histories attached to the result are read with a fixed
+        number of queries: one read selects the matching request rows, and
+        one more read loads the history of exactly those requests. The
+        history read is scoped to the selected ids, so filtering by status
+        never pulls other requests' history in, and the number of reads no
+        longer grows with the number of returned requests.
+        """
         query = (
             "SELECT * FROM exemption_requests "
             + ("WHERE status = ? " if status is not None else "")
@@ -2162,7 +2186,33 @@ class Catalog:
         )
         parameters: tuple = () if status is None else (status,)
         rows = self.connection.execute(query, parameters).fetchall()
-        return [self._request_dict(row) for row in rows]
+        histories: dict[str, list[dict]] = {str(row["id"]): [] for row in rows}
+        if histories:
+            # Join against the same selection rather than binding one
+            # placeholder per id: this stays a single read with the same one
+            # (or zero) status parameter however many requests match, so a
+            # large list cannot overflow SQLite's bound-parameter limit, and
+            # only the selected requests' events are read.
+            event_rows = self.connection.execute(
+                """
+                SELECT e.request_id, e.seq, e.occurred_at, e.actor, e.action,
+                       e.reason, e.from_status, e.to_status
+                FROM exemption_events AS e
+                JOIN (
+                    SELECT id FROM exemption_requests
+                """
+                + ("WHERE status = ? " if status is not None else "")
+                + """
+                ) AS r ON r.id = e.request_id
+                ORDER BY e.request_id, e.seq
+                """,
+                parameters,
+            )
+            for event in event_rows:
+                histories[str(event["request_id"])].append(self._event_dict(event))
+        return [
+            self._request_dict(row, histories[str(row["id"])]) for row in rows
+        ]
 
     def _process_decision(
         self,
