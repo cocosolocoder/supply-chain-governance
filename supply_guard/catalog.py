@@ -847,6 +847,46 @@ def _parse_spdx(document: dict) -> tuple[set[_Identity], set[_Edge]]:
     return graph.result()
 
 
+# ---------------------------------------------------------------------------
+# Retention rule — the single decision shared by SBOM source replacement
+# (import_sbom) and manual-dependency revocation (remove_dependency).
+#
+# Both operations remove declarations and then have to decide which catalog
+# entities actually leave. Keeping that judgment in exactly these two
+# predicates (and reconciling through one Catalog method) means adjusting the
+# rule once covers both operations; the decision can never drift between a
+# re-import and a remove-dependency.
+# ---------------------------------------------------------------------------
+
+# A relationship is retained while it keeps any basis: a manual registration
+# OR a declaration by at least one SBOM source. Revoking the manual entry
+# therefore leaves a source-declared relationship in place, and vice versa.
+# Outer columns are qualified with the real table name so the same predicate is
+# valid inside DELETE, SELECT and EXISTS scopes alike.
+_RELATION_RETAINED_PREDICATE = (
+    "dependencies.manual = 1 OR EXISTS ("
+    "SELECT 1 FROM dependency_sources ds "
+    "WHERE ds.dependency_id = dependencies.id)"
+)
+
+# A component is retained while it keeps any basis: a manual registration, a
+# declaration by at least one source, OR being an endpoint of a manually
+# registered relationship (the anchor that keeps the two ends a surviving
+# manual edge needs). When all three bases vanish the component is deleted.
+# Only *manual* edges anchor endpoints: an edge a source alone declares always
+# has both ends declared by that same source, so it never has to hold an
+# endpoint on its own. Components are judged independently, so one endpoint
+# leaving never blocks or cascades to the other or to anything connected to it.
+_COMPONENT_RETAINED_PREDICATE = (
+    "components.manual = 1 OR EXISTS ("
+    "SELECT 1 FROM component_sources cs "
+    "WHERE cs.component_id = components.id) "
+    "OR EXISTS ("
+    "SELECT 1 FROM dependencies d WHERE d.manual = 1 "
+    "AND (d.dependent_id = components.id OR d.dependency_id = components.id))"
+)
+
+
 class Catalog:
     def __init__(self, database: str | Path = ":memory:") -> None:
         self.connection = sqlite3.connect(str(database))
@@ -999,33 +1039,69 @@ class Catalog:
                 (dependent_id, dependency_id),
             )
 
-    def _delete_orphan_endpoints(self, candidate_ids) -> None:
-        """Delete candidate components no registration or relationship keeps.
+    def _reconcile_retention(
+        self,
+        candidate_dependency_ids: set[int] | None = None,
+        candidate_component_ids: set[int] | tuple[int, ...] | None = None,
+    ) -> tuple[int, int]:
+        """Apply the one retention rule after declarations were removed.
 
-        A component stays while any of these holds: it is manually registered,
-        some SBOM source still declares it, or it is an endpoint of another
-        manually registered dependency. Each candidate is judged on its own,
-        so deleting one relationship never removes a whole component group.
+        This is the only place that deletes entities for having lost every
+        reason to stay, so ``import_sbom`` (source replacement) and
+        ``remove_dependency`` (manual revocation) can never disagree:
+
+        * a relationship leaves only when it is neither manually registered
+          nor declared by any remaining source;
+        * a component leaves only when it is not manually registered, is
+          declared by no remaining source, and is not an endpoint of any
+          surviving manually registered relationship.
+
+        Relationships are reconciled first, so a relationship that loses its
+        last basis releases the endpoints it was anchoring. Components are
+        then judged independently against the surviving relationships — one
+        endpoint leaving never blocks or cascades to the other, or to any
+        connected component.
+
+        The candidate sets bound which entities may be deleted. ``None`` means
+        "every entity" (a source replacement can affect the whole catalog); a
+        targeted operation passes just the edge and the two endpoints it
+        touched, so revoking one relationship can never sweep unrelated
+        entities. The bound is only a scope: the two retention predicates are
+        still what decides each candidate.
+
+        Returns ``(deleted_components, deleted_dependencies)`` counting the
+        rows that actually left, so a source merely losing one declaration
+        while the entity stays (another source/manual basis remains) is never
+        counted as a deletion.
         """
-        for component_id in candidate_ids:
-            self.connection.execute(
-                """
-                DELETE FROM components
-                WHERE id = ?
-                  AND manual = 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM component_sources cs
-                      WHERE cs.component_id = components.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM dependencies d
-                      WHERE d.manual = 1
-                        AND (d.dependent_id = components.id
-                             OR d.dependency_id = components.id)
-                  )
-                """,
-                (component_id,),
-            )
+        if candidate_dependency_ids is None:
+            dependency_scope = ""
+            dependency_params: tuple = ()
+        else:
+            placeholders = ", ".join("?" for _ in candidate_dependency_ids)
+            dependency_scope = f" AND id IN ({placeholders})"
+            dependency_params = tuple(sorted(candidate_dependency_ids))
+        deleted_dependency_cursor = self.connection.execute(
+            f"DELETE FROM dependencies "
+            f"WHERE NOT ({_RELATION_RETAINED_PREDICATE}){dependency_scope}",
+            dependency_params,
+        )
+        deleted_dependency_count = deleted_dependency_cursor.rowcount
+
+        if candidate_component_ids is None:
+            component_scope = ""
+            component_params: tuple = ()
+        else:
+            placeholders = ", ".join("?" for _ in candidate_component_ids)
+            component_scope = f" AND id IN ({placeholders})"
+            component_params = tuple(candidate_component_ids)
+        deleted_component_cursor = self.connection.execute(
+            f"DELETE FROM components "
+            f"WHERE NOT ({_COMPONENT_RETAINED_PREDICATE}){component_scope}",
+            component_params,
+        )
+        deleted_component_count = deleted_component_cursor.rowcount
+        return deleted_component_count, deleted_dependency_count
 
     def remove_dependency(
         self,
@@ -1055,29 +1131,34 @@ class Catalog:
         if dependent_id is None or dependency_id is None:
             # Nothing targeted: succeed without touching the catalog.
             return
+        edge_row = self.connection.execute(
+            "SELECT id FROM dependencies "
+            "WHERE dependent_id = ? AND dependency_id = ?",
+            (dependent_id, dependency_id),
+        ).fetchone()
+        if edge_row is None:
+            # The two components exist but this relationship does not. Succeed
+            # without changing anything: revoking a non-existent manual
+            # registration must not be a way to sweep the endpoints (or any
+            # other component) through the cleanup rule.
+            return
+        edge_id = int(edge_row["id"])
         with self.connection:
             # Only revoke the manual registration; relationships still declared
             # by an imported source continue to participate in impact queries.
             self.connection.execute(
-                "UPDATE dependencies SET manual = 0 "
-                "WHERE dependent_id = ? AND dependency_id = ?",
-                (dependent_id, dependency_id),
+                "UPDATE dependencies SET manual = 0 WHERE id = ?",
+                (edge_id,),
             )
-            self.connection.execute(
-                """
-                DELETE FROM dependencies
-                WHERE dependent_id = ? AND dependency_id = ?
-                  AND manual = 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM dependency_sources ds
-                      WHERE ds.dependency_id = dependencies.id
-                  )
-                """,
-                (dependent_id, dependency_id),
+            # Reapply the single retention rule, scoped to exactly this edge
+            # and its two endpoints: the revoked edge may leave if no source
+            # still declares it, and each end is then judged on its own. The
+            # scope guarantees one end leaving never removes the other or any
+            # connected component, and that unrelated entities are untouched.
+            self._reconcile_retention(
+                candidate_dependency_ids={edge_id},
+                candidate_component_ids={dependent_id, dependency_id},
             )
-            # Endpoints that this edge was the last reason to keep leave the
-            # catalog immediately; each end is retained or removed on its own.
-            self._delete_orphan_endpoints((dependent_id, dependency_id))
 
     def import_sbom(
         self, service: str, source_name: str, sbom: object
@@ -1174,53 +1255,23 @@ class Catalog:
                     (dependency_row_id, source_id),
                 )
 
-            # Orphan cleanup: relationships and components with no source
-            # ownership and no manual registration are deleted. Components
-            # that are endpoints of a manual relationship are kept.
-            orphan_dependency_ids = [
-                int(row["id"])
-                for row in self.connection.execute(
-                    """
-                    SELECT d.id FROM dependencies d
-                    WHERE d.manual = 0
-                      AND NOT EXISTS (
-                          SELECT 1 FROM dependency_sources ds
-                          WHERE ds.dependency_id = d.id
-                      )
-                    """
-                )
-            ]
-            for dependency_row_id in orphan_dependency_ids:
-                self.connection.execute(
-                    "DELETE FROM dependencies WHERE id = ?", (dependency_row_id,)
-                )
-
-            orphan_component_ids = [
-                int(row["id"])
-                for row in self.connection.execute(
-                    """
-                    SELECT c.id FROM components c
-                    WHERE c.manual = 0
-                      AND NOT EXISTS (
-                          SELECT 1 FROM component_sources cs
-                          WHERE cs.component_id = c.id
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1 FROM dependencies d
-                          WHERE d.manual = 1
-                            AND (d.dependent_id = c.id OR d.dependency_id = c.id)
-                      )
-                    """
-                )
-            ]
-            self._delete_orphan_endpoints(orphan_component_ids)
+            # Reapply the single retention rule after this source's ownership
+            # was withdrawn and the new declaration recorded. Scope is the
+            # whole catalog: any relationship no longer manually registered
+            # and declared by no source leaves, and any component that has
+            # likewise lost all three bases follows (independently per
+            # component). The returned counts count rows that actually leave,
+            # so a source merely withdrawing one declaration while another
+            # source or a manual registration keeps the entity is not a
+            # deletion. remove_dependency runs the exact same rule.
+            deleted_components, deleted_dependencies = self._reconcile_retention()
 
         return ImportResult(
             source_components=len(identities),
             added_components=added_components,
-            deleted_components=len(orphan_component_ids),
+            deleted_components=deleted_components,
             added_dependencies=added_dependencies,
-            deleted_dependencies=len(orphan_dependency_ids),
+            deleted_dependencies=deleted_dependencies,
         )
 
     def import_sbom_file(
