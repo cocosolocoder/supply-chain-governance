@@ -134,6 +134,196 @@ validation failures return a non-zero status naming the offending object
 and leave the previous source declaration and all other business data
 unchanged.
 
+## Local OSV vulnerability sources
+
+`import-osv` loads vulnerability records from a local JSON file into a named
+source. The source name scopes the **whole catalog**, not a single service:
+importing the same name again replaces that source's records everywhere.
+
+### File format
+
+The file's top level is an **array of records**. Each record carries:
+
+- `id` — required, non-empty, unique within the file;
+- `affected` — a non-empty array. Each entry names a `package` (`ecosystem`
+  plus `name`) and its version conditions. Only the **PyPI** ecosystem is
+  supported (case-insensitive), and versions compare per **PEP 440**. The
+  conditions are explicit `versions` and `ECOSYSTEM` `ranges` built from
+  `introduced` / `fixed` / `last_affected` events; every affected entry must
+  declare at least one condition. The example below uses explicit versions
+  only;
+- `database_specific.severity` — optional, one of `low`, `medium`, `high`,
+  `critical`. When it is absent the record is stored as `medium` with
+  `severity_basis: "default"`. That medium is a **local fallback, not a
+  rating the source declared** — `impact` and `risk-report` distinguish the
+  two through `severity_basis` (`"declared"` vs `"default"`), so a defaulted
+  medium is never misread as the source's assessment;
+- `withdrawn` — optional timestamp. A withdrawn record is stored but does
+  **not** participate in impact analysis.
+
+### Example
+
+`osv.json`:
+
+```json
+[
+  {
+    "id": "CVE-2026-2001",
+    "affected": [
+      {
+        "package": {"ecosystem": "PyPI", "name": "Flask"},
+        "versions": ["1.5.0"]
+      }
+    ],
+    "database_specific": {"severity": "high"}
+  },
+  {
+    "id": "CVE-2026-2002",
+    "affected": [
+      {
+        "package": {"ecosystem": "PyPI", "name": "urllib3"},
+        "versions": ["2.2.2"]
+      }
+    ]
+  },
+  {
+    "id": "CVE-2026-2003",
+    "affected": [
+      {
+        "package": {"ecosystem": "PyPI", "name": "requests"},
+        "versions": ["2.31.0"]
+      }
+    ],
+    "withdrawn": "2026-02-01T00:00:00Z"
+  },
+  {
+    "id": "CVE-2026-2004",
+    "affected": [
+      {
+        "package": {"ecosystem": "PyPI", "name": "django"},
+        "versions": ["4.2.0"]
+      }
+    ]
+  }
+]
+```
+
+Register a PyPI library and an upper-level component that depends on it, then
+import the source — all against the same local database:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db init
+python3 -m supply_guard.cli --database catalog.db add-component api pypi flask 1.5.0
+python3 -m supply_guard.cli --database catalog.db add-component api pypi urllib3 2.2.2
+python3 -m supply_guard.cli --database catalog.db add-component api pypi web 2.0.0
+python3 -m supply_guard.cli --database catalog.db add-dependency api pypi web 2.0.0 api pypi flask 1.5.0
+python3 -m supply_guard.cli --database catalog.db import-osv nvd ./osv.json
+# 导入漏洞记录: 4 条
+```
+
+`impact` then shows the library hit directly and the upper-level component
+affected through the dependency (abridged):
+
+```json
+[
+  {
+    "component": {"service": "api", "ecosystem": "pypi", "name": "flask", "version": "1.5.0"},
+    "vulnerability": "CVE-2026-2001",
+    "source": "nvd",
+    "severity": "high",
+    "severity_basis": "declared",
+    "direct": true,
+    "matched_conditions": ["==1.5.0"],
+    "path": [{"service": "api", "ecosystem": "pypi", "name": "flask", "version": "1.5.0"}]
+  },
+  {
+    "component": {"service": "api", "ecosystem": "pypi", "name": "urllib3", "version": "2.2.2"},
+    "vulnerability": "CVE-2026-2002",
+    "source": "nvd",
+    "severity": "medium",
+    "severity_basis": "default",
+    "direct": true,
+    "matched_conditions": ["==2.2.2"],
+    "path": [{"service": "api", "ecosystem": "pypi", "name": "urllib3", "version": "2.2.2"}]
+  },
+  {
+    "component": {"service": "api", "ecosystem": "pypi", "name": "web", "version": "2.0.0"},
+    "vulnerability": "CVE-2026-2001",
+    "source": "nvd",
+    "severity": "high",
+    "severity_basis": "declared",
+    "direct": false,
+    "matched_conditions": ["==1.5.0"],
+    "path": [
+      {"service": "api", "ecosystem": "pypi", "name": "web", "version": "2.0.0"},
+      {"service": "api", "ecosystem": "pypi", "name": "flask", "version": "1.5.0"}
+    ]
+  }
+]
+```
+
+Each record identifies the providing `source`, the effective `severity` (with
+its basis), and the dependency `path` from the affected component to the
+directly hit one — `web` is flagged `direct: false` with the path
+`web → flask`. `summary` for this catalog reports `漏洞数量: 2`,
+`受影响组件: 3`, `最高风险: high`.
+
+### Reading the three counts
+
+The same import produces three different numbers, and all three are expected:
+
+- the **import success count** (`导入漏洞记录: 4 条`) counts the split
+  (vulnerability, package) combinations stored for the source — including
+  combinations that match no registered component (CVE-2026-2004/django) and
+  withdrawn ones (CVE-2026-2003);
+- `summary`'s **漏洞数量** counts only vulnerabilities with at least one
+  actual hit (CVE-2026-2001 and CVE-2026-2002 here). Imported vulnerabilities
+  are deduplicated by id and normalized package name **across sources**, so
+  the same CVE for the same package imported from two sources counts once;
+  manually registered vulnerabilities are counted separately, even under the
+  same id;
+- `impact` and `risk-report` keep **one record per (component, vulnerability,
+  source, matched package)**: source differences are preserved (the same CVE
+  from two sources yields two records), and one vulnerability can affect
+  several components (CVE-2026-2001 yields records for both `flask` and
+  `web`).
+
+### Replacing a source
+
+Re-importing a source name **replaces** its previous records; two imports
+never accumulate. Vulnerabilities absent from the new file stop being
+provided by that source, and their impacts disappear immediately. An empty
+array (`[]`) clears the source entirely, and withdrawn records never
+participate in impact analysis either way. Other sources and manually
+registered vulnerabilities are untouched, so clearing one source does **not**
+necessarily remove a component's risk — the same CVE may still arrive from
+another source or from a manual registration.
+
+Continuing the example, re-importing `nvd` with a file that lists only
+CVE-2026-2001 drops CVE-2026-2002 from the source: the `urllib3` impact
+record disappears while `flask` and `web` remain affected, and `summary`
+falls to `漏洞数量: 1`. Importing `[]` under `nvd` afterwards would remove
+those too — but a manual `add-vulnerability CVE-2026-2001 flask high` would
+keep `flask` (and transitively `web`) at risk regardless.
+
+### Failed imports change nothing
+
+If the file cannot be read, is not valid JSON, or **any** record fails
+validation, the command exits non-zero with an error naming the offending
+record, and the source keeps its previous content — the valid records earlier
+in the file are not partially imported, and all other business data
+(components, dependencies, exemptions and their history) is untouched:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db import-osv nvd ./broken.json
+# error: 记录 1: affected[0] 的生态系统 'npm' 不受支持，仅支持 PyPI   (exit 1)
+python3 -m supply_guard.cli --database catalog.db import-osv nvd ./missing.json
+# error: 无法读取文件 ./missing.json: ...                            (exit 1)
+```
+
+After either failure, `summary`, `impact` and `risk-report` keep reporting
+exactly what the last successful import established.
+
 ## Local vulnerability exemptions
 
 A user can request an exemption for **one specific impact record**, another
