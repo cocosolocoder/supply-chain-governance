@@ -222,6 +222,8 @@ class DependencyTests(unittest.TestCase):
             self.catalog.impact(service="api", name="app")
 
     def test_long_chain_queries_do_not_overflow(self) -> None:
+        import tracemalloc
+
         depth = 10000
         self.catalog.add_component("api", "pypi", "c0", "1.0.0")
         for index in range(1, depth):
@@ -231,11 +233,42 @@ class DependencyTests(unittest.TestCase):
                 "api", "pypi", f"c{index}", "1.0.0",
             )
         self.catalog.add_vulnerability("CVE-1", f"c{depth - 1}", "low")
-        records = self.catalog.impact(
-            service="api", ecosystem="pypi", name="c0", version="1.0.0"
+
+        # A full-identity query returns only the target's record; its memory
+        # must scale with the service graph plus the one returned path, never
+        # with the sum of all components' path lengths (quadratic). The old
+        # implementation built one copied path per affected component here
+        # and peaked around 10 GiB.
+        tracemalloc.start()
+        try:
+            head = self.catalog.impact(
+                service="api", ecosystem="pypi", name="c0", version="1.0.0"
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(head), 1)
+        self.assertFalse(head[0]["direct"])
+        self.assertEqual(len(head[0]["path"]), depth)
+        self.assertEqual(
+            [node["name"] for node in head[0]["path"]],
+            [f"c{index}" for index in range(depth)],
         )
-        self.assertEqual(len(records), 1)
-        self.assertEqual(len(records[0]["path"]), depth)
+        self.assertLess(peak, 200 * 1024 * 1024)
+
+        # The directly hit chain tail returns one direct record whose path
+        # contains only itself.
+        tail = self.catalog.impact(
+            service="api",
+            ecosystem="pypi",
+            name=f"c{depth - 1}",
+            version="1.0.0",
+        )
+        self.assertEqual(len(tail), 1)
+        self.assertTrue(tail[0]["direct"])
+        self.assertEqual(
+            [node["name"] for node in tail[0]["path"]], [f"c{depth - 1}"]
+        )
 
     def test_cli_dependency_commands_and_errors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -775,6 +775,14 @@ class ImpactAndSummaryTests(unittest.TestCase):
         )
         self.assertEqual(app_records[0]["matched_conditions"], ["==1.0.0"])
 
+        # A full-identity query for app must reproduce that exact record
+        # (same path endpoint and its conditions), without conditions from
+        # the other affected version leaking in.
+        target_records = self.catalog.impact(
+            service="api", ecosystem="pypi", name="app", version="1.0.0"
+        )
+        self.assertEqual(target_records, app_records)
+
     def test_output_is_independent_of_registration_order(self) -> None:
         def build(reversed_order: bool):
             catalog = Catalog()
