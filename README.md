@@ -150,8 +150,15 @@ The file's top level is an **array of records**. Each record carries:
   supported (case-insensitive), and versions compare per **PEP 440**. The
   conditions are explicit `versions` and `ECOSYSTEM` `ranges` built from
   `introduced` / `fixed` / `last_affected` events; every affected entry must
-  declare at least one condition. The example below uses explicit versions
-  only;
+  declare its **own** non-empty conditions (a non-empty `versions` list or at
+  least one valid range — an open-ended range or one starting at `"0"` is a
+  condition too). Two entries never share conditions: an entry whose package
+  name is identical to another entry's, or only differs by PyPI
+  normalization (`Foo_Bar` vs `foo-bar`), is still rejected when it omits or
+  empties both `versions` and `ranges`. When several valid entries target the
+  same normalized package name, their conditions merge into one
+  vulnerability/package source record and import counts do not multiply per
+  entry. The example below uses explicit versions only;
 - `database_specific.severity` — optional, one of `low`, `medium`, `high`,
   `critical`. When it is absent the record is stored as `medium` with
   `severity_basis: "default"`. That medium is a **local fallback, not a
@@ -320,6 +327,31 @@ python3 -m supply_guard.cli --database catalog.db import-osv nvd ./broken.json
 python3 -m supply_guard.cli --database catalog.db import-osv nvd ./missing.json
 # error: 无法读取文件 ./missing.json: ...                            (exit 1)
 ```
+
+The same applies when one affected entry omits its own version conditions
+even though another entry of the same record carries conditions for the same
+or a normalization-equivalent package:
+
+```json
+[
+  {
+    "id": "CVE-2026-3001",
+    "affected": [
+      {"package": {"ecosystem": "PyPI", "name": "Foo_Bar"}, "versions": ["1.0"]},
+      {"package": {"ecosystem": "PyPI", "name": "foo-bar"}}
+    ]
+  }
+]
+```
+
+```bash
+python3 -m supply_guard.cli --database catalog.db import-osv nvd ./noshares.json
+# error: 记录 0: affected[1]（包 foo-bar）缺少版本条件：必须提供非空 versions 或至少一个合法 ECOSYSTEM ranges  (exit 1)
+```
+
+The error always names the record index in the file, the `affected` entry
+index and that entry's package name, and swapping the two entries only moves
+the reported entry index — the import still fails.
 
 After either failure, `summary`, `impact` and `risk-report` keep reporting
 exactly what the last successful import established.

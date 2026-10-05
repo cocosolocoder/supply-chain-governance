@@ -182,9 +182,13 @@ def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
     """Validate the affected entries of one OSV record.
 
     Returns a mapping of normalized package name to the version conditions
-    declared for that package. Every affected entry must target PyPI; other
-    ecosystems, unknown range types/events, malformed event orders, inverted
-    intervals and unparseable versions reject the whole import.
+    declared for that package, merged across every entry targeting the same
+    normalized name. Every affected entry must target PyPI and must declare
+    its own version conditions — a non-empty explicit versions list or at
+    least one valid ECOSYSTEM range; identical or normalization-equivalent
+    package names never let one entry borrow another entry's conditions.
+    Other ecosystems, unknown range types/events, malformed event orders,
+    inverted intervals and unparseable versions reject the whole import.
     """
     if not isinstance(affected, list) or not affected:
         raise ValueError("affected 必须为非空数组")
@@ -205,7 +209,8 @@ def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
         name = package.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"affected[{index}].package.name 必须为非空字符串")
-        package_name = normalize_pypi_name(name)
+        raw_name = name.strip()
+        package_name = normalize_pypi_name(raw_name)
         conditions: list[dict] = []
 
         versions = entry.get("versions", [])
@@ -315,6 +320,11 @@ def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
                             f"introduced {introduced} 不能大于 last_affected {last_affected}"
                         )
             conditions.extend(intervals)
+        if not conditions:
+            raise ValueError(
+                f"affected[{index}]（包 {raw_name}）缺少版本条件："
+                "必须提供非空 versions 或至少一个合法 ECOSYSTEM ranges"
+            )
         packages.setdefault(package_name, []).extend(conditions)
     return packages
 
@@ -334,9 +344,6 @@ def parse_osv_record(record: object) -> list[dict]:
     identifier = identifier.strip()
 
     packages = _parse_osv_affected(record.get("affected"))
-    for package_name, conditions in packages.items():
-        if not conditions:
-            raise ValueError(f"包 {package_name} 缺少有效版本条件")
 
     severity = "medium"
     severity_default = True
