@@ -1553,6 +1553,215 @@ class NewestRequestSelectionTests(ExemptionFixture):
         self.assertIn("已被撤销", lapsed["not_exempt_reason"])
 
 
+class OneVulnerabilityTwoPackagesTests(unittest.TestCase):
+    """One OSV record hitting two packages keeps two independent scopes.
+
+    A single named-source vulnerability declares both ``lib-a`` 1.0.0 and
+    ``lib-b`` 2.0.0 affected, and ``app`` depends on both. The catalog must
+    keep four impact records — one direct per library and one indirect per
+    dependency path — and the two ``app`` records, although they share the
+    vulnerability id and source, differ in matched package and each need
+    their own exemption request, approval and report link.
+    """
+
+    VULNERABILITY = "CVE-2026-5001"
+    SOURCE = "nvd"
+    EXPIRY = "2026-12-31T23:59:59+00:00"
+    SUBMITTED = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    DECIDED = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    EVALUATED = "2026-01-15T00:00:00+00:00"
+
+    @staticmethod
+    def record(packages):
+        """One OSV record affecting each (name, version) pair given."""
+        return {
+            "id": OneVulnerabilityTwoPackagesTests.VULNERABILITY,
+            "affected": [
+                {
+                    "package": {"ecosystem": "PyPI", "name": name},
+                    "versions": [version],
+                }
+                for name, version in packages
+            ],
+            "database_specific": {"severity": "high"},
+        }
+
+    def setUp(self) -> None:
+        self.catalog = Catalog()
+        self.catalog.add_component("api", "pypi", "app", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib-a", "1.0.0")
+        self.catalog.add_component("api", "pypi", "lib-b", "2.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "lib-a", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "lib-b", "2.0.0"
+        )
+        self.catalog.import_osv(
+            self.SOURCE,
+            [self.record([("lib-a", "1.0.0"), ("lib-b", "2.0.0")])],
+        )
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def entry(self, impacts, name, matched_name):
+        matches = [
+            i for i in impacts
+            if i["component"]["name"] == name
+            and i["matched_name"] == matched_name
+        ]
+        self.assertEqual(
+            len(matches), 1,
+            f"expected exactly one {name}/matched={matched_name} record",
+        )
+        return matches[0]
+
+    def request_app(self, request_id, matched_name):
+        return self.catalog.request_exemption(
+            request_id, "api", "pypi", "app", "1.0.0",
+            self.VULNERABILITY, matched_name, self.SOURCE,
+            "alice", "accept risk", self.EXPIRY,
+            submitted_at=self.SUBMITTED,
+        )
+
+    def report(self):
+        return self.catalog.risk_report(
+            service="api", evaluated_at=self.EVALUATED
+        )
+
+    def test_four_distinct_impacts_before_any_request(self) -> None:
+        impacts = self.catalog.impact(service="api")
+        self.assertEqual(len(impacts), 4)
+
+        lib_a = self.entry(impacts, "lib-a", "lib-a")
+        self.assertTrue(lib_a["direct"])
+        self.assertEqual(lib_a["matched_conditions"], ["==1.0.0"])
+        self.assertEqual([n["name"] for n in lib_a["path"]], ["lib-a"])
+
+        lib_b = self.entry(impacts, "lib-b", "lib-b")
+        self.assertTrue(lib_b["direct"])
+        self.assertEqual(lib_b["matched_conditions"], ["==2.0.0"])
+        self.assertEqual([n["name"] for n in lib_b["path"]], ["lib-b"])
+
+        # The two app records share id and source but are not merged: each
+        # keeps its own matched package, path and hit version conditions.
+        via_a = self.entry(impacts, "app", "lib-a")
+        self.assertFalse(via_a["direct"])
+        self.assertEqual(via_a["matched_conditions"], ["==1.0.0"])
+        self.assertEqual([n["name"] for n in via_a["path"]], ["app", "lib-a"])
+        via_b = self.entry(impacts, "app", "lib-b")
+        self.assertFalse(via_b["direct"])
+        self.assertEqual(via_b["matched_conditions"], ["==2.0.0"])
+        self.assertEqual([n["name"] for n in via_b["path"]], ["app", "lib-b"])
+        for record in impacts:
+            self.assertEqual(record["vulnerability"], self.VULNERABILITY)
+            self.assertEqual(record["source"], self.SOURCE)
+            self.assertEqual(record["severity"], "high")
+
+        report = self.report()
+        self.assertEqual(report["impact_count"], 4)
+        self.assertEqual(report["unhandled_component_count"], 3)
+        self.assertEqual(report["highest_severity"], "high")
+        self.assertFalse(any(i["exempted"] for i in report["impacts"]))
+
+    def test_first_app_exemption_leaves_the_rest_unhandled(self) -> None:
+        self.request_app("EXM-A", "lib-a")
+        approved = self.catalog.approve_exemption(
+            "EXM-A", "bob", "controls verified", decided_at=self.DECIDED
+        )
+        self.assertEqual(approved["approved_severity"], "high")
+        self.assertEqual(approved["approver"], "bob")
+        self.assertEqual(approved["scope"]["matched_name"], "lib-a")
+
+        report = self.report()
+        self.assertEqual(report["impact_count"], 4)
+        via_a = self.entry(report["impacts"], "app", "lib-a")
+        self.assertTrue(via_a["exempted"])
+        self.assertEqual(via_a["exemption_request"], "EXM-A")
+        self.assertIsNone(via_a["not_exempt_reason"])
+        # The other app record and both direct hits stay unexempted and are
+        # not linked to the request.
+        for name, matched in [
+            ("app", "lib-b"), ("lib-a", "lib-a"), ("lib-b", "lib-b"),
+        ]:
+            record = self.entry(report["impacts"], name, matched)
+            self.assertFalse(record["exempted"])
+            self.assertIsNone(record["exemption_request"])
+        self.assertEqual(report["unhandled_component_count"], 3)
+        self.assertEqual(report["highest_severity"], "high")
+
+    def test_second_app_record_needs_and_gets_its_own_request(self) -> None:
+        self.request_app("EXM-A", "lib-a")
+        self.catalog.approve_exemption(
+            "EXM-A", "bob", "ok", decided_at=self.DECIDED
+        )
+        # The approved lib-a scope does not occupy the lib-b scope: a
+        # different id for the other app record is accepted and decided on
+        # its own.
+        self.request_app("EXM-B", "lib-b")
+        approved_b = self.catalog.approve_exemption(
+            "EXM-B", "carol", "also verified", decided_at=self.DECIDED
+        )
+        self.assertEqual(approved_b["scope"]["matched_name"], "lib-b")
+
+        report = self.report()
+        self.assertEqual(report["impact_count"], 4)
+        via_a = self.entry(report["impacts"], "app", "lib-a")
+        self.assertTrue(via_a["exempted"])
+        self.assertEqual(via_a["exemption_request"], "EXM-A")
+        via_b = self.entry(report["impacts"], "app", "lib-b")
+        self.assertTrue(via_b["exempted"])
+        self.assertEqual(via_b["exemption_request"], "EXM-B")
+        # Only the two libraries remain unhandled.
+        for name in ("lib-a", "lib-b"):
+            record = self.entry(report["impacts"], name, name)
+            self.assertFalse(record["exempted"])
+            self.assertIsNone(record["exemption_request"])
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "high")
+
+    def test_approval_fails_when_replacement_drops_the_target_package(
+        self,
+    ) -> None:
+        self.request_app("EXM-A", "lib-a")
+        # The same source is replaced by a record with the same id that now
+        # only affects lib-b: app is still hit by the same vulnerability id
+        # from the same source, but the lib-a scope of the request is gone.
+        self.catalog.import_osv(
+            self.SOURCE, [self.record([("lib-b", "2.0.0")])]
+        )
+
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption(
+                "EXM-A", "bob", "ok", decided_at=self.DECIDED
+            )
+        # The request stays pending with its original history; the surviving
+        # lib-b impact must not be borrowed to complete the approval.
+        record = self.catalog.get_exemption("EXM-A")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approver"])
+        self.assertIsNone(record["approved_severity"])
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
+        self.assertEqual(record["scope"]["matched_name"], "lib-a")
+
+        report = self.report()
+        # Only lib-b and app-via-lib-b remain, neither linked to the
+        # disappeared scope's request.
+        self.assertEqual(report["impact_count"], 2)
+        lib_b = self.entry(report["impacts"], "lib-b", "lib-b")
+        self.assertTrue(lib_b["direct"])
+        via_b = self.entry(report["impacts"], "app", "lib-b")
+        self.assertEqual([n["name"] for n in via_b["path"]], ["app", "lib-b"])
+        for impact in report["impacts"]:
+            self.assertFalse(impact["exempted"])
+            self.assertIsNone(impact["exemption_request"])
+        self.assertEqual(report["unhandled_component_count"], 2)
+        self.assertEqual(report["highest_severity"], "high")
+
+
 class PersistenceAndConcurrencyTests(unittest.TestCase):
     def test_persists_across_reopen_and_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
