@@ -538,9 +538,12 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
 
     Percent-encoding is decoded strictly — every ``%`` must introduce two
     hexadecimal digits and the decoded bytes must be valid UTF-8 — and npm
-    package names keep their scope. Raises ValueError when the purl is
-    missing, malformed, unsupported, carries broken percent-encoding or
-    carries no version.
+    package names keep their scope. The name must be one non-empty segment
+    (PyPI, unscoped npm) or two non-empty segments (scoped npm); empty
+    segments from consecutive or trailing slashes and segments whose
+    decoded text contains a slash are rejected rather than silently
+    dropped. Raises ValueError when the purl is missing, malformed,
+    unsupported, carries broken percent-encoding or carries no version.
     """
     if not isinstance(purl, str) or not purl:
         raise ValueError("purl 必须为非空字符串")
@@ -561,11 +564,22 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     version = _decode_percent_escapes(version, "purl 版本")
     if not version:
         raise ValueError("purl 版本为空")
-    segments = [
-        _decode_percent_escapes(segment, "purl 包名")
-        for segment in name_part.split("/")
-        if segment != ""
-    ]
+    # The name's structure is validated before decoding: every segment must
+    # be non-empty, so consecutive slashes or a trailing slash before the
+    # version separator can never be silently dropped and merge distinct raw
+    # names into one component identity.
+    raw_segments = name_part.split("/")
+    segments: list[str] = []
+    for raw_segment in raw_segments:
+        if raw_segment == "":
+            raise ValueError(f"purl 包名包含空段: {name_part!r}")
+        segment = _decode_percent_escapes(raw_segment, "purl 包名")
+        # A decoded slash would smuggle extra hierarchy into a name segment
+        # (e.g. %2F); decoding happens exactly once, so a literal %2F text
+        # produced by %252F is not re-examined and stays valid.
+        if "/" in segment:
+            raise ValueError(f"purl 包名段还原后包含斜线: {raw_segment!r}")
+        segments.append(segment)
     if ecosystem == "npm":
         if len(segments) == 1:
             name = segments[0]
@@ -577,8 +591,6 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
         if len(segments) != 1:
             raise ValueError("pypi purl 不应包含命名空间")
         name = segments[0]
-    if not name:
-        raise ValueError("purl 包名为空")
     return ecosystem, name, version
 
 

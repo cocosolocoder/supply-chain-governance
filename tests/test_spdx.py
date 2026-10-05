@@ -414,6 +414,52 @@ class SpdxValidationTests(unittest.TestCase):
         self._reject(spdx([package("SPDXRef-a", "pkg:pypi/foo")]))
         self._reject(spdx([package("SPDXRef-a", "not-a-purl")]))
 
+    def test_structurally_invalid_purl_rejected(self) -> None:
+        # Empty name segments and percent-encoded slashes hiding extra
+        # hierarchy reject the whole import.
+        self._reject(spdx([package("SPDXRef-a", "pkg:pypi//foo@1")]))
+        self._reject(spdx([package("SPDXRef-a", "pkg:pypi/foo/@1")]))
+        self._reject(spdx([package("SPDXRef-a", "pkg:pypi/team%2Ffoo@1")]))
+        self._reject(spdx([package("SPDXRef-a", "pkg:npm/%40scope//pkg@1")]))
+
+    def test_structurally_invalid_purl_not_skipped_when_sibling_purl_valid(self) -> None:
+        # One structurally invalid purl poisons the package even when another
+        # purl of the same package is valid.
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                            {
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi/a%2Fb@1",
+                            },
+                        ],
+                    )
+                ]
+            )
+        )
+        self._reject(
+            spdx(
+                [
+                    package(
+                        "SPDXRef-a",
+                        "pkg:pypi/foo@1",
+                        externalRefs=[
+                            {
+                                "referenceType": "purl",
+                                "referenceLocator": "pkg:pypi//foo@1",
+                            },
+                            {"referenceType": "purl", "referenceLocator": "pkg:pypi/foo@1"},
+                        ],
+                    )
+                ]
+            )
+        )
+
     def test_conflicting_purls_rejected(self) -> None:
         self._reject(
             spdx(

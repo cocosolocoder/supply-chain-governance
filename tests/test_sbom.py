@@ -107,6 +107,41 @@ class PurlParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_purl("pkg:pypi/namespace/foo@1")
 
+    def test_empty_name_segment_rejected(self) -> None:
+        # Empty segments are never silently dropped: consecutive slashes or a
+        # trailing slash before the version separator reject the purl.
+        for bad in (
+            "pkg:pypi//foo@1",
+            "pkg:pypi/foo/@1",
+            "pkg:pypi/foo//bar@1",
+            "pkg:npm//pkg@1",
+            "pkg:npm/%40scope//pkg@1",
+            "pkg:npm/%40scope/pkg/@1",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_purl(bad)
+
+    def test_decoded_slash_in_name_segment_rejected(self) -> None:
+        # A percent-encoded slash must not smuggle extra hierarchy into a
+        # name segment, whatever the hex digit case.
+        for bad in (
+            "pkg:pypi/team%2Ffoo@1",
+            "pkg:pypi/team%2ffoo@1",
+            "pkg:npm/%40scope%2Fpkg@1",
+            "pkg:npm/foo%2Fbar@1",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_purl(bad)
+
+    def test_double_encoded_slash_is_literal_text(self) -> None:
+        # %252F decodes exactly once to the literal text %2F, which is not a
+        # slash and must not be rejected as one.
+        self.assertEqual(
+            parse_purl("pkg:pypi/foo%252F@1"), ("pypi", "foo%2F", "1")
+        )
+
 
 class ImportValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -302,6 +337,53 @@ class ImportValidationTests(unittest.TestCase):
                 sbom([component("bad", "pkg:pypi/bar%FF@1")]),
             )
         self.assertIn("UTF-8", str(caught.exception))
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_structurally_invalid_purl_fails_whole_import(self) -> None:
+        # A purl with an empty name segment poisons the whole import even
+        # when every other component is valid.
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                sbom(
+                    [
+                        component("good", "pkg:pypi/foo@1"),
+                        component("bad", "pkg:pypi//sneaky@1"),
+                    ]
+                ),
+            )
+        message = str(caught.exception)
+        self.assertIn("components[1]", message)
+        self.assertIn("bad", message)
+        self.assertEqual(
+            self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM components"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_decoded_slash_purl_fails_whole_import(self) -> None:
+        # A %2F hiding a namespace inside the name segment rejects the import.
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.import_sbom(
+                "api",
+                "src",
+                sbom(
+                    [
+                        component("good", "pkg:npm/%40scope/pkg@1"),
+                        component("bad", "pkg:pypi/team%2Ffoo@1"),
+                    ]
+                ),
+            )
+        message = str(caught.exception)
+        self.assertIn("components[1]", message)
+        self.assertIn("bad", message)
         self.assertEqual(
             self.catalog.connection.execute(
                 "SELECT COUNT(*) FROM components"
