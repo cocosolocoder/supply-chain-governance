@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections import deque
 from contextlib import contextmanager
@@ -10,6 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
+
+from supply_guard import osv
+from supply_guard.osv import (
+    matched_condition_texts,
+    normalize_pypi_name,
+    parse_osv_record,
+)
 
 
 SCHEMA = """
@@ -148,265 +154,34 @@ def format_timestamp(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def normalize_pypi_name(name: str) -> str:
-    """Normalize a PyPI package name per PEP 503.
+# ---------------------------------------------------------------------------
+# Compatibility shims for OSV parsing/matching.
+#
+# The rules themselves live in :mod:`supply_guard.osv`, split into separate
+# entry validation, range interpretation, package-condition merging and
+# matching layers. These thin aliases preserve the historical module-level
+# call surface used by existing callers and saved databases; the persisted
+# condition dict shape is unchanged, so previously imported sources stay
+# usable without migration.
+# ---------------------------------------------------------------------------
 
-    Case is folded and runs of hyphens, underscores and dots are treated as
-    equivalent. Component identities are kept verbatim; this normalization
-    is only used to match OSV records against components.
-    """
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _parse_pep440_version(value: object, context: str) -> Version:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{context} 必须为非空字符串")
-    try:
-        return Version(value.strip())
-    except InvalidVersion as error:
-        raise ValueError(f"无法解析的版本 {value!r}（{context}）") from error
-
-
-def _parse_withdrawn(value: object) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("withdrawn 必须为非空时间戳字符串")
-    timestamp = value.strip()
-    try:
-        datetime.fromisoformat(timestamp)
-    except ValueError as error:
-        raise ValueError(f"withdrawn 时间戳无效: {timestamp!r}") from error
-    return timestamp
+_parse_pep440_version = osv.parse_pep440_version
+_parse_withdrawn = osv.parse_withdrawn
 
 
 def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
-    """Validate the affected entries of one OSV record.
-
-    Returns a mapping of normalized package name to the version conditions
-    declared for that package, merged across every entry targeting the same
-    normalized name. Every affected entry must target PyPI and must declare
-    its own version conditions — a non-empty explicit versions list or at
-    least one valid ECOSYSTEM range; identical or normalization-equivalent
-    package names never let one entry borrow another entry's conditions.
-    Other ecosystems, unknown range types/events, malformed event orders,
-    inverted intervals and unparseable versions reject the whole import.
-    """
-    if not isinstance(affected, list) or not affected:
-        raise ValueError("affected 必须为非空数组")
-    packages: dict[str, list[dict]] = {}
-    for index, entry in enumerate(affected):
-        if not isinstance(entry, dict):
-            raise ValueError(f"affected[{index}] 必须为对象")
-        package = entry.get("package")
-        if not isinstance(package, dict):
-            raise ValueError(f"affected[{index}].package 必须为对象")
-        ecosystem = package.get("ecosystem")
-        if not isinstance(ecosystem, str) or not ecosystem.strip():
-            raise ValueError(f"affected[{index}].package.ecosystem 必须为非空字符串")
-        if ecosystem.strip().lower() != "pypi":
-            raise ValueError(
-                f"affected[{index}] 的生态系统 {ecosystem!r} 不受支持，仅支持 PyPI"
-            )
-        name = package.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"affected[{index}].package.name 必须为非空字符串")
-        raw_name = name.strip()
-        package_name = normalize_pypi_name(raw_name)
-        conditions: list[dict] = []
-
-        versions = entry.get("versions", [])
-        if not isinstance(versions, list):
-            raise ValueError(f"affected[{index}].versions 必须为数组")
-        for version in versions:
-            parsed = _parse_pep440_version(version, f"affected[{index}].versions")
-            conditions.append({"type": "explicit", "version": str(parsed)})
-
-        ranges = entry.get("ranges", [])
-        if not isinstance(ranges, list):
-            raise ValueError(f"affected[{index}].ranges 必须为数组")
-        for range_index, range_entry in enumerate(ranges):
-            if not isinstance(range_entry, dict):
-                raise ValueError(f"affected[{index}].ranges[{range_index}] 必须为对象")
-            range_type = range_entry.get("type")
-            if not isinstance(range_type, str) or not range_type.strip():
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}].type 必须为非空字符串"
-                )
-            if range_type.strip().upper() != "ECOSYSTEM":
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}] 的范围类型 "
-                    f"{range_type!r} 不受支持，仅支持 ECOSYSTEM"
-                )
-            events = range_entry.get("events")
-            if not isinstance(events, list) or not events:
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}].events 必须为非空数组"
-                )
-            intervals: list[dict] = []
-            opened = False
-            for event_index, event in enumerate(events):
-                if not isinstance(event, dict):
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        "必须为对象"
-                    )
-                keys = set(event.keys())
-                if len(keys) != 1:
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        "必须恰好包含一个事件字段"
-                    )
-                key = next(iter(keys))
-                if key not in ("introduced", "fixed", "last_affected"):
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        f"的事件类型 {key!r} 不受支持"
-                    )
-                value = event[key]
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}]"
-                        f".{key} 必须为非空字符串"
-                    )
-                value = value.strip()
-                if key == "introduced":
-                    if opened:
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                            "事件次序非法：introduced 之后不能再次 introduced"
-                        )
-                    intervals.append(
-                        {"type": "interval", "introduced": value,
-                         "fixed": None, "last_affected": None}
-                    )
-                    opened = True
-                else:
-                    if not opened:
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                            f"事件次序非法：{key} 之前缺少 introduced"
-                        )
-                    intervals[-1][key] = value
-                    opened = False
-            for interval in intervals:
-                introduced = interval["introduced"]
-                if introduced != "0":
-                    _parse_pep440_version(
-                        introduced,
-                        f"affected[{index}].ranges[{range_index}].introduced",
-                    )
-                if interval["fixed"] is not None:
-                    fixed = interval["fixed"]
-                    _parse_pep440_version(
-                        fixed, f"affected[{index}].ranges[{range_index}].fixed"
-                    )
-                    if introduced != "0" and not (
-                        Version(introduced) < Version(fixed)
-                    ):
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}] 区间倒置："
-                            f"introduced {introduced} 必须小于 fixed {fixed}"
-                        )
-                if interval["last_affected"] is not None:
-                    last_affected = interval["last_affected"]
-                    _parse_pep440_version(
-                        last_affected,
-                        f"affected[{index}].ranges[{range_index}].last_affected",
-                    )
-                    if introduced != "0" and not (
-                        Version(introduced) <= Version(last_affected)
-                    ):
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}] 区间倒置："
-                            f"introduced {introduced} 不能大于 last_affected {last_affected}"
-                        )
-            conditions.extend(intervals)
-        if not conditions:
-            raise ValueError(
-                f"affected[{index}]（包 {raw_name}）缺少版本条件："
-                "必须提供非空 versions 或至少一个合法 ECOSYSTEM ranges"
-            )
-        packages.setdefault(package_name, []).extend(conditions)
-    return packages
-
-
-def parse_osv_record(record: object) -> list[dict]:
-    """Validate one OSV record and return its normalized rows.
-
-    Each returned row describes one (package, version conditions) pair. The
-    whole record is validated before anything is returned, so callers can
-    reject the entire import on the first invalid record.
-    """
-    if not isinstance(record, dict):
-        raise ValueError("记录必须为 JSON 对象")
-    identifier = record.get("id")
-    if not isinstance(identifier, str) or not identifier.strip():
-        raise ValueError("id 必须为非空字符串")
-    identifier = identifier.strip()
-
-    packages = _parse_osv_affected(record.get("affected"))
-
-    severity = "medium"
-    severity_default = True
-    database_specific = record.get("database_specific")
-    if database_specific is not None:
-        if not isinstance(database_specific, dict):
-            raise ValueError("database_specific 必须为对象")
-        declared = database_specific.get("severity")
-        if declared is not None:
-            if not isinstance(declared, str) or declared.strip().lower() not in SEVERITY_RANK:
-                raise ValueError(
-                    f"database_specific.severity {declared!r} 不受支持，"
-                    "仅接受 low、medium、high、critical"
-                )
-            severity = declared.strip().lower()
-            severity_default = False
-
-    withdrawn = None
-    if "withdrawn" in record:
-        withdrawn = _parse_withdrawn(record["withdrawn"])
-
-    return [
-        {
-            "id": identifier,
-            "package_name": package_name,
-            "severity": severity,
-            "severity_default": severity_default,
-            "withdrawn": withdrawn,
-            "conditions": conditions,
-        }
-        for package_name, conditions in packages.items()
-    ]
+    """Compatibility wrapper around :func:`osv.parse_affected`."""
+    return osv.parse_affected(affected)
 
 
 def _condition_matches(condition: dict, version: Version) -> bool:
-    if condition["type"] == "explicit":
-        return version == Version(condition["version"])
-    if condition["type"] != "interval":
-        return False
-    introduced = condition["introduced"]
-    if introduced != "0" and version < Version(introduced):
-        return False
-    if condition["fixed"] is not None and version >= Version(condition["fixed"]):
-        return False
-    if condition["last_affected"] is not None and version > Version(
-        condition["last_affected"]
-    ):
-        return False
-    return True
+    """Compatibility wrapper around :func:`osv.condition_matches`."""
+    return osv.condition_matches(condition, version)
 
 
 def _format_condition(condition: dict) -> str:
-    if condition["type"] == "explicit":
-        return f"=={condition['version']}"
-    parts: list[str] = []
-    introduced = condition["introduced"]
-    if introduced != "0":
-        parts.append(f">={introduced}")
-    if condition["fixed"] is not None:
-        parts.append(f"<{condition['fixed']}")
-    if condition["last_affected"] is not None:
-        parts.append(f"<={condition['last_affected']}")
-    return ",".join(parts) if parts else "*"
+    """Compatibility wrapper around :func:`osv.format_condition`."""
+    return osv.format_condition(condition)
 
 
 @dataclass(frozen=True)
@@ -1452,11 +1227,9 @@ class Catalog:
                         f"{component['name']}/{component['version']} 版本无法解析"
                     ) from error
                 for record in candidates:
-                    matched_conditions = [
-                        _format_condition(condition)
-                        for condition in record["conditions"]
-                        if _condition_matches(condition, version)
-                    ]
+                    matched_conditions = matched_condition_texts(
+                        record["conditions"], version
+                    )
                     if matched_conditions:
                         key = (record["source"], record["id"], normalized)
                         groups.setdefault(key, {})[component_id] = {
