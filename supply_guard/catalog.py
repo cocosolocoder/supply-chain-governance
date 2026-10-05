@@ -1710,9 +1710,13 @@ class Catalog:
                     queue.append(dependent)
         return affected
 
-    def _affected_ids(self) -> set[int]:
-        _, _, reverse, direct_groups = self._impact_graph()
-        return self._affected_ids_from_groups(direct_groups, reverse)
+    def _affected_ids(
+        self,
+    ) -> tuple[dict[int, dict[str, str]], set[int]]:
+        components, _, reverse, direct_groups = self._impact_graph()
+        return components, self._affected_ids_from_groups(
+            direct_groups, reverse
+        )
 
     def summary(self) -> Summary:
         _, _, reverse, direct_groups = self._impact_graph()
@@ -1756,16 +1760,16 @@ class Catalog:
         )
 
     def affected_services(self) -> list[str]:
-        affected = self._affected_ids()
-        if not affected:
-            return []
-        placeholders = ", ".join("?" for _ in affected)
-        rows = self.connection.execute(
-            f"SELECT DISTINCT service FROM components WHERE id IN ({placeholders}) "
-            "ORDER BY service",
-            sorted(affected),
+        components, affected = self._affected_ids()
+        # The affected ids all come from the already loaded component map, so
+        # the distinct service names are derived in memory: no query binds one
+        # parameter per affected component, and a large manifest cannot hit
+        # SQLite's bound-parameter limit. Sorting by the service string gives
+        # the same order the previous ORDER BY service produced (both compare
+        # text by code point).
+        return sorted(
+            {components[component_id]["service"] for component_id in affected}
         )
-        return [str(row["service"]) for row in rows]
 
     def impact(
         self,
