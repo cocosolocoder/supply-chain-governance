@@ -14,12 +14,22 @@ contract: a request whose every approval precondition holds, and that then
 hits a database write error in one of the two save phases -
 
 1. saving the decision result (``UPDATE exemption_requests``);
-2. saving the approval history (``INSERT INTO exemption_events``).
+2. saving the approval history (``INSERT INTO exemption_events``);
+3. the final ``COMMIT`` that makes both durable - unlike the two save
+   statements, this cannot be faulted with a trigger. A file database still
+   held by another connection's read lock lets ``BEGIN IMMEDIATE`` and both
+   writes proceed inside the transaction and only rejects the ``COMMIT`` (it
+   must upgrade to an exclusive lock) with ``SQLITE_BUSY``.
 
-A failure in either phase must roll the whole approval back atomically. The
+A failure in any phase must roll the whole approval back atomically. The
 request must never be left showing as approved while its history is missing,
 and the risk report must never have deducted the risk without a complete
-approval behind it. Concretely, after either failure:
+approval behind it. The commit-phase case adds one more requirement: after a
+busy commit is rolled back, the same Catalog object must keep working
+without being reopened - SQLite would otherwise leave the failed
+transaction open and show the uncommitted approval as real - and once the
+blocking reader goes away the identical approval must succeed. Concretely,
+after any failure:
 
 * the call raises a database error, never returns an approved record;
 * the request is still ``pending`` with its scope, applicant, reason,
@@ -501,6 +511,127 @@ class ApprovalSaveFailureRollbackTests(unittest.TestCase):
         self._run_failure_scenario(
             "history-save", HISTORY_SAVE_FAILURE_TRIGGER
         )
+
+    def test_final_commit_failure_rolls_back_the_approval(self) -> None:
+        # The two save statements succeed inside the transaction; only the
+        # final COMMIT fails. A second connection holding a read lock on the
+        # file database models the real "temporarily occupied by another read
+        # connection" case: with busy handling switched off the commit returns
+        # SQLITE_BUSY while still inside its transaction. Unlike a trigger
+        # fault there is no schema residue to clean up afterwards.
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            catalog = build_catalog(database)
+            snapshot = self._take_snapshot(catalog)
+            self._assert_report_keeps_pre_approval_result(catalog, snapshot)
+
+            reader = sqlite3.connect(database)
+            try:
+                reader.execute("BEGIN")
+                reader.execute(
+                    "SELECT id FROM exemption_requests"
+                ).fetchall()
+
+                # Do not wait out the reader; a busy COMMIT must fail now.
+                catalog.connection.execute("PRAGMA busy_timeout = 0")
+                statements = []
+                catalog.connection.set_trace_callback(statements.append)
+                try:
+                    with self.assertRaises(sqlite3.Error) as caught:
+                        catalog.approve_exemption(
+                            REQUEST_ID, APPROVER, APPROVAL_NOTE,
+                            decided_at=DECIDED_AT,
+                        )
+                finally:
+                    catalog.connection.set_trace_callback(None)
+                # A commit-stage database error, never a business-rule
+                # ValueError: every precondition held and both writes ran.
+                self.assertNotIsInstance(caught.exception, ValueError)
+                self.assertEqual(type(caught.exception), sqlite3.OperationalError)
+                self.assertEqual(str(caught.exception), "database is locked")
+
+                normalized = [s.strip() for s in statements]
+                self.assertIn("BEGIN IMMEDIATE", normalized)
+                # Both save phases completed before the commit was attempted.
+                self.assertTrue(
+                    any(
+                        s.startswith("UPDATE exemption_requests")
+                        for s in normalized
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        s.startswith("INSERT INTO exemption_events")
+                        for s in normalized
+                    )
+                )
+                # The commit really was attempted, failed, and was then
+                # rolled back - the failed transaction is not left open.
+                commit_index = normalized.index("COMMIT")
+                rollback_index = normalized.index("ROLLBACK")
+                self.assertLess(commit_index, rollback_index)
+                self.assertEqual(
+                    normalized[rollback_index:], ["ROLLBACK"]
+                )
+                self.assertFalse(catalog.connection.in_transaction)
+
+                # The same Catalog object, still blocked by the reader, must
+                # read back the pre-approval state - no uncommitted approval
+                # visible on this connection and the risk never deducted.
+                self._assert_target_still_pristine_pending(catalog, snapshot)
+                self._assert_other_request_untouched(catalog)
+                self._assert_report_keeps_pre_approval_result(
+                    catalog, snapshot
+                )
+            finally:
+                reader.rollback()
+                reader.close()
+
+            # Durable rollback on a reopened file database as well: nothing of
+            # the failed approval reached disk.
+            reopened = Catalog(database)
+            self._assert_target_still_pristine_pending(reopened, snapshot)
+            self._assert_other_request_untouched(reopened)
+            self._assert_report_keeps_pre_approval_result(reopened, snapshot)
+            reopened.close()
+
+            # Once the database is writable again the very same Catalog
+            # object keeps working without being reopened, and retrying the
+            # approval succeeds with one new history event at seq 2.
+            approved = catalog.approve_exemption(
+                REQUEST_ID, APPROVER, APPROVAL_NOTE, decided_at=DECIDED_AT
+            )
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["approver"], APPROVER)
+            self.assertEqual(approved["decision_note"], APPROVAL_NOTE)
+            self.assertEqual(approved["approved_severity"], "high")
+            self.assertEqual(
+                approved["decided_at"], format_timestamp(DECIDED_AT)
+            )
+            self.assertEqual(
+                [(event["action"], event["seq"]) for event in approved["events"]],
+                [("request", 1), ("approve", 2)],
+            )
+            decision_event = approved["events"][1]
+            self.assertEqual(decision_event["actor"], APPROVER)
+            self.assertEqual(decision_event["reason"], APPROVAL_NOTE)
+            self.assertEqual(decision_event["from_status"], "pending")
+            self.assertEqual(decision_event["to_status"], "approved")
+
+            # The successful approval now updates request detail and risk
+            # report together, scoped to exactly the requested nvd impact.
+            report = catalog.risk_report(service=SERVICE, evaluated_at=EVAL_AT)
+            target = find_entry(report, "app", SOURCE)
+            self.assertTrue(target["exempted"])
+            self.assertEqual(target["exemption_request"], REQUEST_ID)
+            self.assertIsNone(target["not_exempt_reason"])
+            other_indirect = find_entry(report, "app", OTHER_SOURCE)
+            self.assertFalse(other_indirect["exempted"])
+            self.assertEqual(
+                other_indirect["exemption_request"], OTHER_REQUEST_ID
+            )
+            self._assert_other_request_untouched(catalog)
+            catalog.close()
 
 
 class BusinessRejectionContrastTests(unittest.TestCase):

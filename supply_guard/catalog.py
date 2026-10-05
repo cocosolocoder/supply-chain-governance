@@ -993,8 +993,20 @@ class Catalog:
         except Exception:
             self.connection.rollback()
             raise
-        else:
+        try:
             self.connection.commit()
+        except Exception:
+            # The final commit is itself a write that can fail - e.g. another
+            # connection may hold a read lock on the file database, so a
+            # COMMIT upgrading to an exclusive lock returns SQLITE_BUSY.
+            # SQLite keeps the transaction open after such a failure, which
+            # would leave the uncommitted decision (new status, approver,
+            # history event) readable on this same connection as though the
+            # approval had succeeded. Roll it back explicitly so the approval
+            # fails as a whole and this connection stays usable for a later
+            # retry, then surface the original database error unchanged.
+            self.connection.rollback()
+            raise
 
     def add_component(
         self, service: str, ecosystem: str, name: str, version: str
