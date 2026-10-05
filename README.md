@@ -150,8 +150,12 @@ The file's top level is an **array of records**. Each record carries:
   supported (case-insensitive), and versions compare per **PEP 440**. The
   conditions are explicit `versions` and `ECOSYSTEM` `ranges` built from
   `introduced` / `fixed` / `last_affected` events; every affected entry must
-  declare at least one condition. The example below uses explicit versions
-  only;
+  declare at least one condition of its own — missing fields and empty arrays
+  count alike, and an entry never borrows conditions from another entry whose
+  package name is identical or only differs by PyPI normalization. Entries
+  normalizing to the same package are still merged into one record, with every
+  declared version participating in matching. The example below uses explicit
+  versions only;
 - `database_specific.severity` — optional, one of `low`, `medium`, `high`,
   `critical`. When it is absent the record is stored as `medium` with
   `severity_basis: "default"`. That medium is a **local fallback, not a

@@ -191,6 +191,72 @@ class ParseValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_osv_record(osv_record("CVE-1"))
 
+    def test_conditionless_entry_cannot_borrow_another_entry(self) -> None:
+        # A second affected entry normalizing to the same package must declare
+        # its own conditions; an explicit list on the first entry does not
+        # cover an entry that omits versions and ranges entirely.
+        first = {
+            "package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+            "versions": ["1.0"],
+        }
+        second = {"package": {"ecosystem": "PyPI", "name": "foo-bar"}}
+        for affected in ([first, second], [second, first]):
+            with self.subTest(affected=affected):
+                with self.assertRaises(ValueError) as context:
+                    parse_osv_record({"id": "CVE-1", "affected": affected})
+                message = str(context.exception)
+                self.assertIn("affected[", message)
+                self.assertIn("foo-bar", message)
+
+    def test_conditionless_entry_empty_fields_rejected(self) -> None:
+        # Both fields absent, both empty arrays, or either one empty all count
+        # as the entry declaring no version condition.
+        templates = [
+            {},
+            {"versions": [], "ranges": []},
+            {"versions": []},
+            {"ranges": []},
+        ]
+        valid = {
+            "package": {"ecosystem": "PyPI", "name": "foo.bar"},
+            "versions": ["1.0"],
+        }
+        for template in templates:
+            entry = {"package": {"ecosystem": "PyPI", "name": "FOO_BAR"}}
+            entry.update(template)
+            with self.subTest(template=template):
+                with self.assertRaises(ValueError):
+                    parse_osv_record(
+                        {"id": "CVE-1", "affected": [valid, entry]}
+                    )
+                with self.assertRaises(ValueError):
+                    parse_osv_record(
+                        {"id": "CVE-1", "affected": [entry, valid]}
+                    )
+
+    def test_entries_normalizing_to_same_package_merge_conditions(self) -> None:
+        rows = parse_osv_record(
+            {
+                "id": "CVE-1",
+                "affected": [
+                    {"package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+                     "versions": ["1.0"]},
+                    {"package": {"ecosystem": "PyPI", "name": "foo-bar"},
+                     "ranges": [
+                         {"type": "ECOSYSTEM",
+                          "events": [{"introduced": "2.0"}, {"fixed": "3.0"}]}
+                     ]},
+                ],
+            }
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["package_name"], "foo-bar")
+        self.assertEqual(
+            [condition["type"] for condition in rows[0]["conditions"]],
+            ["explicit", "interval"],
+        )
+
+
     def test_withdrawn_must_be_valid_timestamp(self) -> None:
         with self.assertRaises(ValueError):
             parse_osv_record(
@@ -533,6 +599,72 @@ class ImportBehaviorTests(unittest.TestCase):
                     osv_record("CVE-1", versions=["2.0.0"]),
                 ],
             )
+
+    def test_conditionless_affected_entry_rejected_regardless_of_order(self) -> None:
+        valid_entry = {
+            "package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+            "versions": ["1.0"],
+        }
+        empty_entry = {"package": {"ecosystem": "PyPI", "name": "foo-bar"}}
+        for affected in ([valid_entry, empty_entry], [empty_entry, valid_entry]):
+            with self.assertRaises(ValueError) as context:
+                self.catalog.import_osv(
+                    "src", [{"id": "CVE-1", "affected": affected}]
+                )
+            message = str(context.exception)
+            self.assertIn("记录 0", message)
+            self.assertIn("affected[", message)
+            self.assertIn("foo-bar", message)
+
+    def test_conditionless_entry_after_valid_records_leaves_source_unchanged(self) -> None:
+        self.catalog.import_osv("src", [osv_record("CVE-OLD", versions=["9.9"])])
+        with self.assertRaises(ValueError):
+            self.catalog.import_osv(
+                "src",
+                [
+                    osv_record("CVE-NEW", versions=["1.0.0"]),
+                    {
+                        "id": "CVE-BAD",
+                        "affected": [
+                            {"package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+                             "versions": ["1.0"]},
+                            {"package": {"ecosystem": "PyPI", "name": "foo-bar"}},
+                        ],
+                    },
+                ],
+            )
+        self.assertEqual(
+            [row["id"] for row in self.catalog._osv_records()], ["CVE-OLD"]
+        )
+
+    def test_entries_same_normalized_package_merge_into_one_row(self) -> None:
+        count = self.catalog.import_osv(
+            "src",
+            [
+                {
+                    "id": "CVE-1",
+                    "affected": [
+                        {"package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+                         "versions": ["1.0"]},
+                        {"package": {"ecosystem": "PyPI", "name": "foo-bar"},
+                         "ranges": [
+                             {"type": "ECOSYSTEM",
+                              "events": [{"introduced": "2.0"}, {"fixed": "3.0"}]}
+                         ]},
+                    ],
+                }
+            ],
+        )
+        # Two affected entries merge into one (vulnerability, package) source
+        # record; the import count is not repeated per entry.
+        self.assertEqual(count, 1)
+        self.catalog.add_component("api", "pypi", "foo.bar", "1.0")
+        self.catalog.add_component("api", "pypi", "foo_bar", "2.5")
+        records = self.catalog.impact()
+        self.assertEqual(len(records), 2)
+        by_version = {r["component"]["version"]: r["matched_conditions"] for r in records}
+        self.assertEqual(by_version["1.0"], ["==1.0"])
+        self.assertEqual(by_version["2.5"], [">=2.0,<3.0"])
 
     def test_failure_leaves_catalog_unchanged(self) -> None:
         self.catalog.import_osv("src", [osv_record("CVE-1", versions=["1.0.0"])])
@@ -917,6 +1049,50 @@ class CliTests(unittest.TestCase):
             catalog = Catalog(database)
             catalog.add_component("api", "pypi", "flask", "1.0.0")
             self.assertEqual(len(catalog.impact()), 1)
+            catalog.close()
+
+    def test_conditionless_affected_entry_fails_command(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            good = Path(directory, "good.json")
+            good.write_text(osv_file([osv_record("CVE-1", versions=["1.0.0"])]))
+            bad = Path(directory, "bad.json")
+            bad.write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "CVE-2",
+                            "affected": [
+                                {"package": {"ecosystem": "PyPI", "name": "Foo_Bar"},
+                                 "versions": ["1.0"]},
+                                {"package": {"ecosystem": "PyPI", "name": "foo-bar"}},
+                            ],
+                        }
+                    ]
+                )
+            )
+            self.assertEqual(
+                main(["--database", database, "import-osv", "src", str(good)]), 0
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = main(
+                    ["--database", database, "import-osv", "src", str(bad)]
+                )
+            self.assertEqual(status, 1)
+            self.assertNotIn("导入漏洞记录", stdout.getvalue())
+            error = stderr.getvalue()
+            self.assertIn("记录 0", error)
+            self.assertIn("affected[1]", error)
+            self.assertIn("foo-bar", error)
+            catalog = Catalog(database)
+            catalog.add_component("api", "pypi", "flask", "1.0.0")
+            records = catalog.impact()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["vulnerability"], "CVE-1")
             catalog.close()
 
 
