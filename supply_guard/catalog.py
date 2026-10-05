@@ -538,9 +538,12 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
 
     Percent-encoding is decoded strictly — every ``%`` must introduce two
     hexadecimal digits and the decoded bytes must be valid UTF-8 — and npm
-    package names keep their scope. Raises ValueError when the purl is
-    missing, malformed, unsupported, carries broken percent-encoding or
-    carries no version.
+    package names keep their scope. The name must be one non-empty segment
+    for PyPI, and one (unscoped) or two (scoped) non-empty segments for
+    npm: empty segments (including consecutive slashes or a trailing slash
+    before the version) and segments that decode to a path separator are
+    rejected. Raises ValueError when the purl is missing, malformed,
+    unsupported, carries broken percent-encoding or carries no version.
     """
     if not isinstance(purl, str) or not purl:
         raise ValueError("purl 必须为非空字符串")
@@ -561,11 +564,15 @@ def parse_purl(purl: object) -> tuple[str, str, str]:
     version = _decode_percent_escapes(version, "purl 版本")
     if not version:
         raise ValueError("purl 版本为空")
+    raw_segments = name_part.split("/")
+    if any(segment == "" for segment in raw_segments):
+        raise ValueError("purl 包名包含空段")
     segments = [
         _decode_percent_escapes(segment, "purl 包名")
-        for segment in name_part.split("/")
-        if segment != ""
+        for segment in raw_segments
     ]
+    if any("/" in segment for segment in segments):
+        raise ValueError("purl 包名段还原后包含路径分隔符")
     if ecosystem == "npm":
         if len(segments) == 1:
             name = segments[0]

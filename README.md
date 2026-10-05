@@ -96,6 +96,15 @@ Python `Catalog.import_sbom` / `import_sbom_file` entry points.
 python3 -m supply_guard.cli --database catalog.db import-sbom api src ./api.spdx.json
 ```
 
+Both formats take a component's identity from its purl. The package name
+must be exactly one non-empty segment for PyPI, and one (unscoped) or two
+(`@scope/pkg`) non-empty segments for npm: empty segments — consecutive
+slashes or a trailing slash before the version (`pkg:pypi//foo@1`,
+`pkg:pypi/foo/@1`) — are rejected, and so is any name segment that
+percent-decodes to a path separator (`pkg:pypi/team%2Ffoo@1`). Decoding
+still happens exactly once, so `%252F` stays the literal text `%2F` and is
+accepted. Any component violating these rules fails the whole import.
+
 SPDX rules:
 
 - `spdxVersion` must be `SPDX-2.3`, `packages` must be an array (an empty
