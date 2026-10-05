@@ -1744,31 +1744,13 @@ class Catalog:
                 )
 
         if all(value is not None for value in identity_filter):
-            # A full identity resolves exactly one component. The graph is
-            # still built first (including OSV version matching for the whole
-            # service), so a bad version in the service fails this query even
-            # when the target does not exist; afterwards propagation is
-            # bounded by the target's forward closure and only its own paths
-            # are materialized. On a long chain this keeps memory growing
-            # with the service graph and the returned paths instead of the
-            # paths of every other affected component.
-            components, forward, reverse, direct_groups = self._impact_graph(
-                service
+            # A full identity resolves exactly one component; the lookup,
+            # closure-bounded propagation and record construction are the
+            # single shared computation the exemption checks also run, so
+            # this query can never disagree with a request/approval check.
+            records = self._target_impact_records(
+                service, ecosystem, name, version
             )
-            target_id = self._component_id(service, ecosystem, name, version)
-            if target_id is None:
-                records = []
-            else:
-                reachable = self._forward_reachable(target_id, forward)
-                records = self._impact_records(
-                    service,
-                    target_id=target_id,
-                    reachable=reachable,
-                    components=components,
-                    forward=forward,
-                    reverse=reverse,
-                    direct_groups=direct_groups,
-                )
         else:
             # Build the graph within the service scope up front, so components
             # of other services never take part in OSV version matching or
@@ -1856,6 +1838,56 @@ class Catalog:
                 )
 
         return records
+
+    def _target_impact_records(
+        self,
+        service: str,
+        ecosystem: str,
+        name: str,
+        version: str,
+    ) -> list[dict]:
+        """All current impact records of exactly one component identity.
+
+        This is the single component-location/impact-computation path shared
+        by the full-identity ``impact`` query and by exemption submission and
+        approval: all three locate the target the same way and judge it
+        through the same closure-bounded run of :meth:`_impact_records`, so on
+        identical data a query and an exemption check can never disagree about
+        whether the component is affected or about the record contents.
+
+        The whole-service graph — including OSV version matching for every
+        component of the service — is built before the target is resolved, so
+        a version in this service that has to be compared with an OSV record
+        but cannot be parsed is still an error naming that component, even
+        when the requested target does not exist. A component of another
+        service never enters the service-scoped graph and so cannot fail the
+        lookup. A target that simply is not registered yields an empty list;
+        the caller decides what that means (an empty query result or a failed
+        exemption request/approval).
+
+        Propagation is then bounded by the target's own forward dependency
+        closure and only the target's record per group is materialized. Every
+        distance and path inside the closure is computed by the same rules as
+        the unbounded run, so each returned record is identical to the
+        corresponding record of the service-wide impact list — including
+        indirect hits reached only through dependencies — while temporary
+        memory grows with the service graph and the target's returned paths,
+        not with the full paths of every other affected component.
+        """
+        components, forward, reverse, direct_groups = self._impact_graph(service)
+        target_id = self._component_id(service, ecosystem, name, version)
+        if target_id is None:
+            return []
+        reachable = self._forward_reachable(target_id, forward)
+        return self._impact_records(
+            service,
+            target_id=target_id,
+            reachable=reachable,
+            components=components,
+            forward=forward,
+            reverse=reverse,
+            direct_groups=direct_groups,
+        )
 
     @staticmethod
     def _forward_reachable(
@@ -1959,44 +1991,32 @@ class Catalog:
         """The live impact record exactly matching ``scope``, if it exists now.
 
         This is the one existence/equality lookup shared by submission and
-        approval: matching runs only inside the scope's target service, so a
-        component with an unparseable version in another service neither
-        fails the check nor is mistaken for the target, while the service's
-        full dependency graph still participates — an upstream component
-        reached only through dependencies counts as affected, and finding a
-        same-named record without the dependency path does not. A version
-        that has to be compared with an OSV record inside this service
-        remains a query error (raised while the graph is built); the
-        directly hit library and a component depending on it are different
-        records, a manual ``None`` source never matches a named OSV source,
-        and two named sources are judged independently.
+        approval, and its component location and impact computation are the
+        very same full-identity query the ``impact`` command runs
+        (:meth:`_target_impact_records`): matching runs only inside the
+        scope's target service, so a component with an unparseable version in
+        another service neither fails the check nor is mistaken for the
+        target, while the service's full dependency graph still participates
+        — an upstream component reached only through dependencies counts as
+        affected, and finding a same-named record without the dependency path
+        does not. A version that has to be compared with an OSV record inside
+        this service remains a query error raised while the graph is built,
+        even when the target itself does not exist.
 
-        The lookup is decoupled from the service-wide impact report: the
-        whole-service graph is still built up front (so OSV version matching
-        validates every component of the service exactly as the report
-        does), but propagation is then bounded by the target's forward
-        dependency closure and only the target's own record per group is
-        materialized — the identical record the service-wide query returns
-        for it, since both run through :meth:`_impact_records`. Temporary
-        memory therefore grows with the service's components, edges and the
-        target's own paths instead of accumulating the full dependency path
-        of every affected component on the chain.
+        The query returns at most the target's own records, so the scope
+        equality rule (:func:`_scope_matches_record`) is the only thing left
+        to decide here: the directly hit library and a component depending on
+        it are different records, a manual ``None`` source never matches a
+        named OSV source, two named sources and different vulnerability ids
+        or matched packages are judged independently, and PyPI name
+        normalization — which only matched OSV records to components upstream
+        — never widens a scope. Memory grows with the service graph and the
+        target's own paths, not with the accumulated paths of every other
+        affected component, exactly as for a full-identity query.
         """
-        components, forward, reverse, direct_groups = self._impact_graph(
-            scope[0]
-        )
-        target_id = self._component_id(scope[0], scope[1], scope[2], scope[3])
-        if target_id is None:
-            return None
-        reachable = self._forward_reachable(target_id, forward)
-        for record in self._impact_records(
-            scope[0],
-            target_id=target_id,
-            reachable=reachable,
-            components=components,
-            forward=forward,
-            reverse=reverse,
-            direct_groups=direct_groups,
+        service, ecosystem, name, version = scope[:4]
+        for record in self._target_impact_records(
+            service, ecosystem, name, version
         ):
             if _scope_matches_record(scope, record):
                 return record
