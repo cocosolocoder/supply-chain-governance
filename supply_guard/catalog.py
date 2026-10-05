@@ -1970,8 +1970,34 @@ class Catalog:
         directly hit library and a component depending on it are different
         records, a manual ``None`` source never matches a named OSV source,
         and two named sources are judged independently.
+
+        The lookup is decoupled from the service-wide impact report: the
+        whole-service graph is still built up front (so OSV version matching
+        validates every component of the service exactly as the report
+        does), but propagation is then bounded by the target's forward
+        dependency closure and only the target's own record per group is
+        materialized — the identical record the service-wide query returns
+        for it, since both run through :meth:`_impact_records`. Temporary
+        memory therefore grows with the service's components, edges and the
+        target's own paths instead of accumulating the full dependency path
+        of every affected component on the chain.
         """
-        for record in self._impact_records(scope[0]):
+        components, forward, reverse, direct_groups = self._impact_graph(
+            scope[0]
+        )
+        target_id = self._component_id(scope[0], scope[1], scope[2], scope[3])
+        if target_id is None:
+            return None
+        reachable = self._forward_reachable(target_id, forward)
+        for record in self._impact_records(
+            scope[0],
+            target_id=target_id,
+            reachable=reachable,
+            components=components,
+            forward=forward,
+            reverse=reverse,
+            direct_groups=direct_groups,
+        ):
             if _scope_matches_record(scope, record):
                 return record
         return None
