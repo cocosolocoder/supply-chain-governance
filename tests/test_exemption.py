@@ -655,6 +655,200 @@ class ServiceScopedValidationTests(ExemptionFixture):
             self.catalog.risk_report(service="worker")
 
 
+class LongChainExemptionScalingTests(unittest.TestCase):
+    """Submission/approval of one record must not build the whole report.
+
+    A single service holds a chain of ``depth`` components laid out head to
+    tail (``c0 -> c1 -> ... -> c{depth-1}``); both a manual vulnerability and
+    a named OSV record directly hit only the chain tail. Requesting or
+    approving an exemption for one specific impact — the tail's direct record
+    or the head's indirect record — must follow the ordinary direct/indirect
+    rules while temporary memory grows with the service graph and the
+    target's own path, never by accumulating the complete path of every
+    component on the chain (which used to grow quadratically and did not even
+    finish on a 10k chain).
+    """
+
+    DEPTH = 10000
+    MEMORY_CAP = 25 * 1024 * 1024
+    EXPIRES = "2030-01-01T00:00:00+00:00"
+    MANUAL = "CVE-MAN"
+    OSV = "CVE-OSV"
+    SOURCE = "nvd"
+
+    def setUp(self) -> None:
+        import tracemalloc
+
+        self.tracemalloc = tracemalloc
+        self.catalog = Catalog()
+        self.catalog.add_component("api", "pypi", "c0", "1.0.0")
+        for index in range(1, self.DEPTH):
+            self.catalog.add_component(
+                "api", "pypi", f"c{index}", "1.0.0"
+            )
+            self.catalog.add_dependency(
+                "api", "pypi", f"c{index - 1}", "1.0.0",
+                "api", "pypi", f"c{index}", "1.0.0",
+            )
+        tail = f"c{self.DEPTH - 1}"
+        self.catalog.add_vulnerability(self.MANUAL, tail, "high")
+        self.catalog.import_osv(
+            self.SOURCE,
+            [
+                {
+                    "id": self.OSV,
+                    "affected": [
+                        {
+                            "package": {"ecosystem": "PyPI", "name": tail},
+                            "versions": ["1.0.0"],
+                        }
+                    ],
+                    "database_specific": {"severity": "low"},
+                }
+            ],
+        )
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def _peak(self, operation):
+        """Run one operation, returning its result and tracemalloc peak."""
+        self.tracemalloc.start()
+        try:
+            result = operation()
+            _, peak = self.tracemalloc.get_traced_memory()
+        finally:
+            self.tracemalloc.stop()
+        return result, peak
+
+    def test_direct_tail_request_and_approval_use_only_their_path(self) -> None:
+        tail = f"c{self.DEPTH - 1}"
+        for vulnerability, source in (
+            (self.MANUAL, None),
+            (self.OSV, self.SOURCE),
+        ):
+            with self.subTest(vulnerability=vulnerability):
+                request_id = f"REQ-{vulnerability}-TAIL"
+                record, peak = self._peak(
+                    lambda: self.catalog.request_exemption(
+                        request_id, "api", "pypi", tail, "1.0.0",
+                        vulnerability, tail, source,
+                        "alice", "accept risk", self.EXPIRES,
+                    )
+                )
+                self.assertEqual(record["status"], "pending")
+                self.assertEqual(record["scope"]["name"], tail)
+                self.assertEqual(record["scope"]["source"], source)
+                self.assertEqual(len(record["events"]), 1)
+                self.assertLess(peak, self.MEMORY_CAP)
+
+                approved, peak = self._peak(
+                    lambda: self.catalog.approve_exemption(
+                        request_id, "bob", "ok"
+                    )
+                )
+                self.assertEqual(approved["status"], "approved")
+                expected_severity = "low" if source is not None else "high"
+                self.assertEqual(
+                    approved["approved_severity"], expected_severity
+                )
+                self.assertEqual(
+                    [event["action"] for event in approved["events"]],
+                    ["request", "approve"],
+                )
+                self.assertLess(peak, self.MEMORY_CAP)
+
+    def test_indirect_head_request_and_approval_use_full_chain_path(self) -> None:
+        tail = f"c{self.DEPTH - 1}"
+        for vulnerability, source in (
+            (self.MANUAL, None),
+            (self.OSV, self.SOURCE),
+        ):
+            with self.subTest(vulnerability=vulnerability):
+                request_id = f"REQ-{vulnerability}-HEAD"
+                record, peak = self._peak(
+                    lambda: self.catalog.request_exemption(
+                        request_id, "api", "pypi", "c0", "1.0.0",
+                        vulnerability, tail, source,
+                        "alice", "accept risk", self.EXPIRES,
+                    )
+                )
+                # The head is affected only transitively through the whole
+                # chain: the same indirect rule as a service-wide report.
+                self.assertEqual(record["status"], "pending")
+                self.assertEqual(record["scope"]["name"], "c0")
+                self.assertEqual(record["scope"]["matched_name"], tail)
+                self.assertEqual(record["scope"]["source"], source)
+                self.assertEqual(len(record["events"]), 1)
+                self.assertLess(peak, self.MEMORY_CAP)
+
+                approved, peak = self._peak(
+                    lambda: self.catalog.approve_exemption(
+                        request_id, "carol", "ok"
+                    )
+                )
+                self.assertEqual(approved["status"], "approved")
+                expected_severity = "low" if source is not None else "high"
+                self.assertEqual(
+                    approved["approved_severity"], expected_severity
+                )
+                self.assertEqual(
+                    [event["action"] for event in approved["events"]],
+                    ["request", "approve"],
+                )
+                self.assertLess(peak, self.MEMORY_CAP)
+
+    def test_missing_target_on_long_chain_leaves_no_record(self) -> None:
+        tail = f"c{self.DEPTH - 1}"
+        # Another service may hold a component with the head's same name, but
+        # it has no chain reaching the hit, so it cannot stand in for the
+        # target.
+        self.catalog.add_component("worker", "pypi", "c0", "1.0.0")
+        with self.assertRaises(ValueError):
+            self.catalog.request_exemption(
+                "REQ-OTHER-SERVICE", "worker", "pypi", "c0", "1.0.0",
+                self.MANUAL, tail, None,
+                "alice", "accept risk", self.EXPIRES,
+            )
+        # A wrong vulnerability / source on the real head is refused without
+        # borrowing the tail's other-source record.
+        with self.assertRaises(ValueError):
+            self.catalog.request_exemption(
+                "REQ-WRONG-SRC", "api", "pypi", "c0", "1.0.0",
+                self.MANUAL, tail, self.SOURCE,
+                "alice", "accept risk", self.EXPIRES,
+            )
+        with self.assertRaises(ValueError):
+            self.catalog.request_exemption(
+                "REQ-WRONG-VULN", "api", "pypi", "c0", "1.0.0",
+                "CVE-NOPE", tail, None,
+                "alice", "accept risk", self.EXPIRES,
+            )
+        self.assertEqual(self.catalog.list_exemptions(), [])
+
+    def test_disappeared_target_blocks_approval_without_extra_history(
+        self,
+    ) -> None:
+        tail = f"c{self.DEPTH - 1}"
+        self.catalog.request_exemption(
+            "REQ-HEAD", "api", "pypi", "c0", "1.0.0",
+            self.OSV, tail, self.SOURCE,
+            "alice", "accept risk", self.EXPIRES,
+        )
+        # Remove the dependency edge that lets the head reach the hit: the
+        # target impact disappears, so approval fails and the request stays
+        # pending with just its request event.
+        self.catalog.remove_dependency(
+            "api", "pypi", "c0", "1.0.0", "api", "pypi", "c1", "1.0.0"
+        )
+        with self.assertRaises(ValueError):
+            self.catalog.approve_exemption("REQ-HEAD", "bob", "gone")
+        record = self.catalog.get_exemption("REQ-HEAD")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["approved_severity"])
+        self.assertEqual(len(record["events"]), 1)
+
+
 class DecisionTests(ExemptionFixture):
     def test_approve_records_severity_and_history(self) -> None:
         self.request()

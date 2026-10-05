@@ -1744,31 +1744,11 @@ class Catalog:
                 )
 
         if all(value is not None for value in identity_filter):
-            # A full identity resolves exactly one component. The graph is
-            # still built first (including OSV version matching for the whole
-            # service), so a bad version in the service fails this query even
-            # when the target does not exist; afterwards propagation is
-            # bounded by the target's forward closure and only its own paths
-            # are materialized. On a long chain this keeps memory growing
-            # with the service graph and the returned paths instead of the
-            # paths of every other affected component.
-            components, forward, reverse, direct_groups = self._impact_graph(
-                service
+            # A full identity resolves exactly one component; only that
+            # component's own records are materialized.
+            records = self._target_impact_records(
+                service, ecosystem, name, version
             )
-            target_id = self._component_id(service, ecosystem, name, version)
-            if target_id is None:
-                records = []
-            else:
-                reachable = self._forward_reachable(target_id, forward)
-                records = self._impact_records(
-                    service,
-                    target_id=target_id,
-                    reachable=reachable,
-                    components=components,
-                    forward=forward,
-                    reverse=reverse,
-                    direct_groups=direct_groups,
-                )
         else:
             # Build the graph within the service scope up front, so components
             # of other services never take part in OSV version matching or
@@ -1777,6 +1757,46 @@ class Catalog:
 
         records.sort(key=_impact_sort_key)
         return records
+
+    def _target_impact_records(
+        self,
+        service: str,
+        ecosystem: str,
+        name: str,
+        version: str,
+    ) -> list[dict]:
+        """Resolve one full component identity and return only its impacts.
+
+        This is the single target-resolution rule shared by a full-identity
+        ``impact`` query and the per-record exemption check, so deciding what
+        currently affects one named component can never drift from the
+        service-wide report.
+
+        The whole service graph — including OSV version matching — is built
+        first, exactly as for a service-wide query: a bad version anywhere in
+        the service that has to be compared with an OSV record still raises,
+        naming the component, even when that component is nowhere near the
+        target or when the target itself does not exist. Afterwards
+        propagation is bounded by the target's forward dependency closure and
+        only the target's own records are built, so on a long chain the work
+        grows with the service graph and the target's paths instead of
+        materializing the full path of every other affected component (which
+        used to grow quadratically on a single long chain).
+        """
+        components, forward, reverse, direct_groups = self._impact_graph(service)
+        target_id = self._component_id(service, ecosystem, name, version)
+        if target_id is None:
+            return []
+        reachable = self._forward_reachable(target_id, forward)
+        return self._impact_records(
+            service,
+            target_id=target_id,
+            reachable=reachable,
+            components=components,
+            forward=forward,
+            reverse=reverse,
+            direct_groups=direct_groups,
+        )
 
     def _impact_records(
         self,
@@ -1959,19 +1979,30 @@ class Catalog:
         """The live impact record exactly matching ``scope``, if it exists now.
 
         This is the one existence/equality lookup shared by submission and
-        approval: matching runs only inside the scope's target service, so a
-        component with an unparseable version in another service neither
-        fails the check nor is mistaken for the target, while the service's
-        full dependency graph still participates — an upstream component
-        reached only through dependencies counts as affected, and finding a
-        same-named record without the dependency path does not. A version
-        that has to be compared with an OSV record inside this service
-        remains a query error (raised while the graph is built); the
-        directly hit library and a component depending on it are different
-        records, a manual ``None`` source never matches a named OSV source,
-        and two named sources are judged independently.
+        approval. It resolves only the scope's own target component instead of
+        generating the target service's whole impact report and discarding
+        every other record: the service graph and every direct hit are still
+        built service-wide first, so a component with an unparseable version in
+        another service neither fails the check nor is mistaken for the
+        target, while the service's full dependency graph still participates —
+        an upstream component reached only through dependencies counts as
+        affected, and finding a same-named record without the dependency path
+        does not. A version that has to be compared with an OSV record
+        anywhere inside this service remains a query error raised while that
+        service-wide graph is built, never skipped just because it is far from
+        the target; the directly hit library and a component depending on it
+        are different records, a manual ``None`` source never matches a named
+        OSV source, and two named sources are judged independently.
+
+        Only the target's own records are materialized (propagation is bounded
+        by the target's forward dependency closure), so a single check on a
+        long chain grows with the service graph and the target's path rather
+        than accumulating the complete path of every affected component.
         """
-        for record in self._impact_records(scope[0]):
+        service, ecosystem, name, version = scope[:4]
+        for record in self._target_impact_records(
+            service, ecosystem, name, version
+        ):
             if _scope_matches_record(scope, record):
                 return record
         return None
