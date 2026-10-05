@@ -178,14 +178,174 @@ def _parse_withdrawn(value: object) -> str:
     return timestamp
 
 
+def _osv_entry_package(entry: object, index: int) -> tuple[str, str]:
+    """Validate one affected entry's package target.
+
+    Returns the declared (stripped) package name and its normalized PyPI
+    form. Only PyPI entries are accepted; anything else rejects the import.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError(f"affected[{index}] 必须为对象")
+    package = entry.get("package")
+    if not isinstance(package, dict):
+        raise ValueError(f"affected[{index}].package 必须为对象")
+    ecosystem = package.get("ecosystem")
+    if not isinstance(ecosystem, str) or not ecosystem.strip():
+        raise ValueError(f"affected[{index}].package.ecosystem 必须为非空字符串")
+    if ecosystem.strip().lower() != "pypi":
+        raise ValueError(
+            f"affected[{index}] 的生态系统 {ecosystem!r} 不受支持，仅支持 PyPI"
+        )
+    name = package.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"affected[{index}].package.name 必须为非空字符串")
+    raw_name = name.strip()
+    return raw_name, normalize_pypi_name(raw_name)
+
+
+def _osv_explicit_conditions(entry: dict, index: int) -> list[dict]:
+    """The explicit-version conditions declared by one affected entry."""
+    conditions: list[dict] = []
+    versions = entry.get("versions", [])
+    if not isinstance(versions, list):
+        raise ValueError(f"affected[{index}].versions 必须为数组")
+    for version in versions:
+        parsed = _parse_pep440_version(version, f"affected[{index}].versions")
+        conditions.append({"type": "explicit", "version": str(parsed)})
+    return conditions
+
+
+def _osv_intervals_from_events(events: object, range_context: str) -> list[dict]:
+    """Interpret one range's event list as version intervals.
+
+    An ``introduced`` event opens a new interval; a ``fixed`` or
+    ``last_affected`` event closes the currently open one. Any other order
+    (a second ``introduced`` while one is open, or a closing event with no
+    open interval) is rejected, as are unknown event types and events that
+    are not exactly one field. ``range_context`` locates the range in error
+    messages (``affected[i].ranges[j]``).
+    """
+    if not isinstance(events, list) or not events:
+        raise ValueError(f"{range_context}.events 必须为非空数组")
+    intervals: list[dict] = []
+    opened = False
+    for event_index, event in enumerate(events):
+        event_context = f"{range_context}.events[{event_index}]"
+        if not isinstance(event, dict):
+            raise ValueError(f"{event_context} 必须为对象")
+        keys = set(event.keys())
+        if len(keys) != 1:
+            raise ValueError(f"{event_context} 必须恰好包含一个事件字段")
+        key = next(iter(keys))
+        if key not in ("introduced", "fixed", "last_affected"):
+            raise ValueError(f"{event_context} 的事件类型 {key!r} 不受支持")
+        value = event[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{event_context}.{key} 必须为非空字符串")
+        value = value.strip()
+        if key == "introduced":
+            if opened:
+                raise ValueError(
+                    f"{event_context} "
+                    "事件次序非法：introduced 之后不能再次 introduced"
+                )
+            intervals.append(
+                {"type": "interval", "introduced": value,
+                 "fixed": None, "last_affected": None}
+            )
+            opened = True
+        else:
+            if not opened:
+                raise ValueError(
+                    f"{event_context} 事件次序非法：{key} 之前缺少 introduced"
+                )
+            intervals[-1][key] = value
+            opened = False
+    return intervals
+
+
+def _validate_osv_interval(interval: dict, range_context: str) -> None:
+    """Check one interval's versions parse and its bounds are not inverted.
+
+    ``introduced`` of ``"0"`` means no lower bound and is exempt from both
+    parsing and the inversion comparisons.
+    """
+    introduced = interval["introduced"]
+    if introduced != "0":
+        _parse_pep440_version(introduced, f"{range_context}.introduced")
+    if interval["fixed"] is not None:
+        fixed = interval["fixed"]
+        _parse_pep440_version(fixed, f"{range_context}.fixed")
+        if introduced != "0" and not (Version(introduced) < Version(fixed)):
+            raise ValueError(
+                f"{range_context} 区间倒置："
+                f"introduced {introduced} 必须小于 fixed {fixed}"
+            )
+    if interval["last_affected"] is not None:
+        last_affected = interval["last_affected"]
+        _parse_pep440_version(last_affected, f"{range_context}.last_affected")
+        if introduced != "0" and not (
+            Version(introduced) <= Version(last_affected)
+        ):
+            raise ValueError(
+                f"{range_context} 区间倒置："
+                f"introduced {introduced} 不能大于 last_affected {last_affected}"
+            )
+
+
+def _osv_range_conditions(entry: dict, index: int) -> list[dict]:
+    """The interval conditions declared by one affected entry's ranges."""
+    conditions: list[dict] = []
+    ranges = entry.get("ranges", [])
+    if not isinstance(ranges, list):
+        raise ValueError(f"affected[{index}].ranges 必须为数组")
+    for range_index, range_entry in enumerate(ranges):
+        range_context = f"affected[{index}].ranges[{range_index}]"
+        if not isinstance(range_entry, dict):
+            raise ValueError(f"{range_context} 必须为对象")
+        range_type = range_entry.get("type")
+        if not isinstance(range_type, str) or not range_type.strip():
+            raise ValueError(f"{range_context}.type 必须为非空字符串")
+        if range_type.strip().upper() != "ECOSYSTEM":
+            raise ValueError(
+                f"{range_context} 的范围类型 {range_type!r} 不受支持，仅支持 ECOSYSTEM"
+            )
+        intervals = _osv_intervals_from_events(
+            range_entry.get("events"), range_context
+        )
+        for interval in intervals:
+            _validate_osv_interval(interval, range_context)
+        conditions.extend(intervals)
+    return conditions
+
+
+def _parse_osv_entry(entry: object, index: int) -> tuple[str, list[dict]]:
+    """Validate one affected entry and return its package and conditions.
+
+    Every entry must independently declare at least one version condition —
+    a non-empty explicit versions list or at least one valid ECOSYSTEM
+    range. Conditions are never shared between entries, so an entry without
+    its own conditions rejects the import no matter what any identically or
+    equivalently named sibling entry declares.
+    """
+    raw_name, package_name = _osv_entry_package(entry, index)
+    conditions = _osv_explicit_conditions(entry, index)
+    conditions.extend(_osv_range_conditions(entry, index))
+    if not conditions:
+        raise ValueError(
+            f"affected[{index}]（包 {raw_name}）缺少版本条件："
+            "必须提供非空 versions 或至少一个合法 ECOSYSTEM ranges"
+        )
+    return package_name, conditions
+
+
 def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
     """Validate the affected entries of one OSV record.
 
     Returns a mapping of normalized package name to the version conditions
     declared for that package, merged across every entry targeting the same
-    normalized name. Every affected entry must target PyPI and must declare
-    its own version conditions — a non-empty explicit versions list or at
-    least one valid ECOSYSTEM range; identical or normalization-equivalent
+    normalized name. Merging only ever combines conditions of entries that
+    each validated on their own; identical or normalization-equivalent
     package names never let one entry borrow another entry's conditions.
     Other ecosystems, unknown range types/events, malformed event orders,
     inverted intervals and unparseable versions reject the whole import.
@@ -194,137 +354,7 @@ def _parse_osv_affected(affected: object) -> dict[str, list[dict]]:
         raise ValueError("affected 必须为非空数组")
     packages: dict[str, list[dict]] = {}
     for index, entry in enumerate(affected):
-        if not isinstance(entry, dict):
-            raise ValueError(f"affected[{index}] 必须为对象")
-        package = entry.get("package")
-        if not isinstance(package, dict):
-            raise ValueError(f"affected[{index}].package 必须为对象")
-        ecosystem = package.get("ecosystem")
-        if not isinstance(ecosystem, str) or not ecosystem.strip():
-            raise ValueError(f"affected[{index}].package.ecosystem 必须为非空字符串")
-        if ecosystem.strip().lower() != "pypi":
-            raise ValueError(
-                f"affected[{index}] 的生态系统 {ecosystem!r} 不受支持，仅支持 PyPI"
-            )
-        name = package.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"affected[{index}].package.name 必须为非空字符串")
-        raw_name = name.strip()
-        package_name = normalize_pypi_name(raw_name)
-        conditions: list[dict] = []
-
-        versions = entry.get("versions", [])
-        if not isinstance(versions, list):
-            raise ValueError(f"affected[{index}].versions 必须为数组")
-        for version in versions:
-            parsed = _parse_pep440_version(version, f"affected[{index}].versions")
-            conditions.append({"type": "explicit", "version": str(parsed)})
-
-        ranges = entry.get("ranges", [])
-        if not isinstance(ranges, list):
-            raise ValueError(f"affected[{index}].ranges 必须为数组")
-        for range_index, range_entry in enumerate(ranges):
-            if not isinstance(range_entry, dict):
-                raise ValueError(f"affected[{index}].ranges[{range_index}] 必须为对象")
-            range_type = range_entry.get("type")
-            if not isinstance(range_type, str) or not range_type.strip():
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}].type 必须为非空字符串"
-                )
-            if range_type.strip().upper() != "ECOSYSTEM":
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}] 的范围类型 "
-                    f"{range_type!r} 不受支持，仅支持 ECOSYSTEM"
-                )
-            events = range_entry.get("events")
-            if not isinstance(events, list) or not events:
-                raise ValueError(
-                    f"affected[{index}].ranges[{range_index}].events 必须为非空数组"
-                )
-            intervals: list[dict] = []
-            opened = False
-            for event_index, event in enumerate(events):
-                if not isinstance(event, dict):
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        "必须为对象"
-                    )
-                keys = set(event.keys())
-                if len(keys) != 1:
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        "必须恰好包含一个事件字段"
-                    )
-                key = next(iter(keys))
-                if key not in ("introduced", "fixed", "last_affected"):
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                        f"的事件类型 {key!r} 不受支持"
-                    )
-                value = event[key]
-                if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"affected[{index}].ranges[{range_index}].events[{event_index}]"
-                        f".{key} 必须为非空字符串"
-                    )
-                value = value.strip()
-                if key == "introduced":
-                    if opened:
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                            "事件次序非法：introduced 之后不能再次 introduced"
-                        )
-                    intervals.append(
-                        {"type": "interval", "introduced": value,
-                         "fixed": None, "last_affected": None}
-                    )
-                    opened = True
-                else:
-                    if not opened:
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}].events[{event_index}] "
-                            f"事件次序非法：{key} 之前缺少 introduced"
-                        )
-                    intervals[-1][key] = value
-                    opened = False
-            for interval in intervals:
-                introduced = interval["introduced"]
-                if introduced != "0":
-                    _parse_pep440_version(
-                        introduced,
-                        f"affected[{index}].ranges[{range_index}].introduced",
-                    )
-                if interval["fixed"] is not None:
-                    fixed = interval["fixed"]
-                    _parse_pep440_version(
-                        fixed, f"affected[{index}].ranges[{range_index}].fixed"
-                    )
-                    if introduced != "0" and not (
-                        Version(introduced) < Version(fixed)
-                    ):
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}] 区间倒置："
-                            f"introduced {introduced} 必须小于 fixed {fixed}"
-                        )
-                if interval["last_affected"] is not None:
-                    last_affected = interval["last_affected"]
-                    _parse_pep440_version(
-                        last_affected,
-                        f"affected[{index}].ranges[{range_index}].last_affected",
-                    )
-                    if introduced != "0" and not (
-                        Version(introduced) <= Version(last_affected)
-                    ):
-                        raise ValueError(
-                            f"affected[{index}].ranges[{range_index}] 区间倒置："
-                            f"introduced {introduced} 不能大于 last_affected {last_affected}"
-                        )
-            conditions.extend(intervals)
-        if not conditions:
-            raise ValueError(
-                f"affected[{index}]（包 {raw_name}）缺少版本条件："
-                "必须提供非空 versions 或至少一个合法 ECOSYSTEM ranges"
-            )
+        package_name, conditions = _parse_osv_entry(entry, index)
         packages.setdefault(package_name, []).extend(conditions)
     return packages
 
