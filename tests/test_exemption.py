@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -2193,6 +2195,581 @@ class CliTests(unittest.TestCase):
             self.assertEqual(ids, ["REQ-1"])
             self.assertEqual(
                 check.get_exemption("REQ-1")["status"], "approved"
+            )
+            check.close()
+
+
+class ExemptionListRegressionTests(unittest.TestCase):
+    """Business-result guarantees of the exemption list (all/status filtered).
+
+    The fixture deliberately stacks easily confused requests:
+
+    - ``R-MAN`` / ``R-NVD`` / ``R-GHSA`` pin the same component
+      (api lib 1.0.0) and the same vulnerability id (CVE-SHARED), differing
+      only by source: manual registration vs the nvd OSV source vs the ghsa
+      OSV source;
+    - ``R-OLD`` and ``R-NEW`` pin the very same scope (api lib 1.0.0 /
+      CVE-MAN / manual): an old request approved before its term expired and
+      a later, brand-new id submitted after that expiry.
+
+    Every request is filed at a controlled instant so the ordering
+    (submission time newest first, id ascending within one instant) is
+    deterministic:
+
+    - 2026-05-01  R-NEW   pending, same scope as R-OLD
+    - 2026-04-01  R-PEND  pending (app via nvd), submission-only history
+    - 2026-03-01  R-WEB   approved then revoked, three events
+    - 2026-02-01  R-GHSA  rejected, R-MAN pending, R-NVD approved (same
+                 instant -> id ascending)
+    - 2026-01-01  R-OLD   approved before 2026-02-01, term now expired
+    """
+
+    STATUSES = (None, "pending", "approved", "rejected", "revoked")
+    EXPIRED_TERM = "2026-02-01T00:00:00+00:00"
+    FUTURE_TERM = "2030-01-01T00:00:00+00:00"
+
+    EXPECTED_ORDER = [
+        "R-NEW", "R-PEND", "R-WEB",
+        "R-GHSA", "R-MAN", "R-NVD", "R-OLD",
+    ]
+    EXPECTED_BY_STATUS = {
+        "pending": ["R-NEW", "R-PEND", "R-MAN"],
+        "approved": ["R-NVD", "R-OLD"],
+        "rejected": ["R-GHSA"],
+        "revoked": ["R-WEB"],
+    }
+
+    @staticmethod
+    def instant(month, day=1):
+        return datetime(2026, month, day, tzinfo=timezone.utc)
+
+    def build_catalog(self, database=":memory:"):
+        catalog = Catalog(database)
+        for name in ("app", "web", "lib"):
+            catalog.add_component("api", "pypi", name, "1.0.0")
+        catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "web", "1.0.0"
+        )
+        catalog.add_dependency(
+            "api", "pypi", "web", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        catalog.add_vulnerability("CVE-MAN", "lib", "high")
+        # A manual observation shares the id carried by both OSV sources.
+        catalog.add_vulnerability("CVE-SHARED", "lib", "critical")
+        catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-SHARED", package="lib", severity="low",
+                        versions=["1.0.0"])],
+        )
+        catalog.import_osv(
+            "ghsa",
+            [osv_record("CVE-SHARED", package="lib", severity="medium",
+                        versions=["1.0.0"])],
+        )
+
+        # Old approved request whose term has expired; the scope is free
+        # again afterwards for the newer R-NEW id.
+        catalog.request_exemption(
+            "R-OLD", "api", "pypi", "lib", "1.0.0", "CVE-MAN", "lib", None,
+            "alice", "reason R-OLD", self.EXPIRED_TERM,
+            submitted_at=self.instant(1),
+        )
+        catalog.approve_exemption(
+            "R-OLD", "bob", "approve R-OLD", decided_at=self.instant(1, 2)
+        )
+
+        # Same instant, same component and vulnerability id, three sources:
+        # ghsa rejected, manual pending, nvd approved — three independent
+        # requests whose histories must never merge.
+        catalog.request_exemption(
+            "R-GHSA", "api", "pypi", "lib", "1.0.0",
+            "CVE-SHARED", "lib", "ghsa",
+            "alice", "reason R-GHSA", self.FUTURE_TERM,
+            submitted_at=self.instant(2),
+        )
+        catalog.reject_exemption(
+            "R-GHSA", "bob", "reject R-GHSA", decided_at=self.instant(2, 2)
+        )
+        catalog.request_exemption(
+            "R-MAN", "api", "pypi", "lib", "1.0.0",
+            "CVE-SHARED", "lib", None,
+            "alice", "reason R-MAN", self.FUTURE_TERM,
+            submitted_at=self.instant(2),
+        )
+        catalog.request_exemption(
+            "R-NVD", "api", "pypi", "lib", "1.0.0",
+            "CVE-SHARED", "lib", "nvd",
+            "alice", "reason R-NVD", self.FUTURE_TERM,
+            submitted_at=self.instant(2),
+        )
+        catalog.approve_exemption(
+            "R-NVD", "bob", "approve R-NVD", decided_at=self.instant(2, 2)
+        )
+
+        # Full request -> approve -> revoke lifecycle on the transitive
+        # manual hit against web.
+        catalog.request_exemption(
+            "R-WEB", "api", "pypi", "web", "1.0.0",
+            "CVE-MAN", "lib", None,
+            "alice", "reason R-WEB", self.FUTURE_TERM,
+            submitted_at=self.instant(3),
+        )
+        catalog.approve_exemption(
+            "R-WEB", "bob", "approve R-WEB", decided_at=self.instant(3)
+        )
+        catalog.revoke_exemption(
+            "R-WEB", "carol", "revoke R-WEB", revoked_at=self.instant(3, 2)
+        )
+
+        # A submission-only pending request on app through the nvd source.
+        catalog.request_exemption(
+            "R-PEND", "api", "pypi", "app", "1.0.0",
+            "CVE-SHARED", "lib", "nvd",
+            "alice", "reason R-PEND", self.FUTURE_TERM,
+            submitted_at=self.instant(4),
+        )
+
+        # New id reusing R-OLD's scope after the old term expired.
+        catalog.request_exemption(
+            "R-NEW", "api", "pypi", "lib", "1.0.0", "CVE-MAN", "lib", None,
+            "alice", "reason R-NEW", self.FUTURE_TERM,
+            submitted_at=self.instant(5),
+        )
+        return catalog
+
+    def setUp(self) -> None:
+        self.catalog = self.build_catalog()
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+
+    def test_ordering_newest_first_with_id_tiebreaker(self) -> None:
+        self.assertEqual(
+            [row["id"] for row in self.catalog.list_exemptions()],
+            self.EXPECTED_ORDER,
+        )
+        # The filter chooses which requests appear; it never changes the
+        # ordering rule, including the same-instant id tiebreaker.
+        for status, expected in self.EXPECTED_BY_STATUS.items():
+            with self.subTest(status=status):
+                self.assertEqual(
+                    [row["id"]
+                     for row in self.catalog.list_exemptions(status=status)],
+                    expected,
+                )
+
+    def test_filtered_ids_partition_the_full_list(self) -> None:
+        partition = []
+        for status in ("pending", "approved", "rejected", "revoked"):
+            partition.extend(
+                row["id"]
+                for row in self.catalog.list_exemptions(status=status)
+            )
+        self.assertEqual(sorted(partition), sorted(self.EXPECTED_ORDER))
+
+    def test_every_listed_record_matches_its_single_fetch_view(self) -> None:
+        # Content and history travel together under one id: whatever the
+        # filter, a listed record is exactly exemption-show's record, so a
+        # list row can neither borrow another request's scope nor its
+        # history.
+        for status in self.STATUSES:
+            with self.subTest(status=status):
+                rows = self.catalog.list_exemptions(status=status)
+                for row in rows:
+                    self.assertEqual(
+                        row, self.catalog.get_exemption(row["id"])
+                    )
+
+    def test_each_record_keeps_its_full_scope_and_fields(self) -> None:
+        by_id = {
+            row["id"]: row for row in self.catalog.list_exemptions()
+        }
+        expected_scopes = {
+            "R-OLD": ("api", "pypi", "lib", "1.0.0",
+                      "CVE-MAN", "lib", None),
+            "R-NEW": ("api", "pypi", "lib", "1.0.0",
+                      "CVE-MAN", "lib", None),
+            "R-MAN": ("api", "pypi", "lib", "1.0.0",
+                      "CVE-SHARED", "lib", None),
+            "R-NVD": ("api", "pypi", "lib", "1.0.0",
+                      "CVE-SHARED", "lib", "nvd"),
+            "R-GHSA": ("api", "pypi", "lib", "1.0.0",
+                       "CVE-SHARED", "lib", "ghsa"),
+            "R-WEB": ("api", "pypi", "web", "1.0.0",
+                      "CVE-MAN", "lib", None),
+            "R-PEND": ("api", "pypi", "app", "1.0.0",
+                       "CVE-SHARED", "lib", "nvd"),
+        }
+        for request_id, scope_values in expected_scopes.items():
+            record = by_id[request_id]
+            self.assertEqual(
+                tuple(record["scope"][field] for field in (
+                    "service", "ecosystem", "name", "version",
+                    "vulnerability", "matched_name", "source",
+                )),
+                scope_values,
+            )
+            self.assertEqual(record["applicant"], "alice")
+            self.assertEqual(record["reason"], f"reason {request_id}")
+            self.assertTrue(record["created_at"])
+            self.assertTrue(record["expires_at"])
+
+        # Approval and revocation info stays attached to the right request.
+        self.assertEqual(by_id["R-OLD"]["status"], "approved")
+        self.assertEqual(by_id["R-OLD"]["approver"], "bob")
+        self.assertEqual(by_id["R-OLD"]["decision_note"], "approve R-OLD")
+        self.assertEqual(by_id["R-OLD"]["approved_severity"], "high")
+        self.assertIsNone(by_id["R-OLD"]["revoker"])
+        self.assertEqual(by_id["R-NVD"]["approved_severity"], "low")
+        self.assertEqual(by_id["R-GHSA"]["approver"], "bob")
+        self.assertEqual(by_id["R-GHSA"]["decision_note"], "reject R-GHSA")
+        web = by_id["R-WEB"]
+        self.assertEqual(web["status"], "revoked")
+        self.assertEqual(web["approver"], "bob")
+        self.assertEqual(web["revoker"], "carol")
+        self.assertEqual(web["revoke_note"], "revoke R-WEB")
+        self.assertIsNotNone(web["decided_at"])
+        self.assertIsNotNone(web["revoked_at"])
+        for pending_id in ("R-NEW", "R-PEND", "R-MAN"):
+            pending = by_id[pending_id]
+            self.assertEqual(pending["status"], "pending")
+            self.assertIsNone(pending["approver"])
+            self.assertIsNone(pending["approved_severity"])
+            self.assertIsNone(pending["revoker"])
+
+    def test_history_starts_with_submission_and_runs_in_order(self) -> None:
+        expected_history = {
+            "R-OLD": [
+                ("request", "alice", "reason R-OLD", None, "pending"),
+                ("approve", "bob", "approve R-OLD", "pending", "approved"),
+            ],
+            "R-NEW": [
+                ("request", "alice", "reason R-NEW", None, "pending"),
+            ],
+            "R-PEND": [
+                ("request", "alice", "reason R-PEND", None, "pending"),
+            ],
+            "R-MAN": [
+                ("request", "alice", "reason R-MAN", None, "pending"),
+            ],
+            "R-NVD": [
+                ("request", "alice", "reason R-NVD", None, "pending"),
+                ("approve", "bob", "approve R-NVD", "pending", "approved"),
+            ],
+            "R-GHSA": [
+                ("request", "alice", "reason R-GHSA", None, "pending"),
+                ("reject", "bob", "reject R-GHSA", "pending", "rejected"),
+            ],
+            "R-WEB": [
+                ("request", "alice", "reason R-WEB", None, "pending"),
+                ("approve", "bob", "approve R-WEB", "pending", "approved"),
+                ("revoke", "carol", "revoke R-WEB", "approved", "revoked"),
+            ],
+        }
+        by_id = {
+            row["id"]: row for row in self.catalog.list_exemptions()
+        }
+        for request_id, expected in expected_history.items():
+            events = by_id[request_id]["events"]
+            self.assertEqual(
+                [(e["action"], e["actor"], e["reason"],
+                  e["from_status"], e["to_status"]) for e in events],
+                expected,
+            )
+            self.assertEqual([e["seq"] for e in events],
+                             list(range(1, len(expected) + 1)))
+            self.assertEqual(events[0]["action"], "request")
+            self.assertEqual(events[0]["from_status"], None)
+            # Times are present and chronological.
+            self.assertEqual(
+                [e["at"] for e in events],
+                sorted(e["at"] for e in events),
+            )
+
+    def test_status_filter_never_trims_or_extends_history(self) -> None:
+        # An approved row keeps its submission event; a revoked row keeps all
+        # three events; every event reason carries its own request id, so no
+        # other request's history can be smuggled in.
+        for status, request_ids in self.EXPECTED_BY_STATUS.items():
+            for row in self.catalog.list_exemptions(status=status):
+                self.assertEqual(row["events"][0]["action"], "request")
+                self.assertTrue(
+                    all(row["id"] in event["reason"]
+                        for event in row["events"]),
+                    f"{row['id']} history contains another request's event",
+                )
+                self.assertEqual(
+                    row["events"],
+                    self.catalog.get_exemption(row["id"])["events"],
+                )
+        revoked = self.catalog.list_exemptions(status="revoked")[0]
+        self.assertEqual(
+            [e["action"] for e in revoked["events"]],
+            ["request", "approve", "revoke"],
+        )
+        rejected = self.catalog.list_exemptions(status="rejected")[0]
+        self.assertEqual(
+            [e["action"] for e in rejected["events"]],
+            ["request", "reject"],
+        )
+
+    def test_manual_and_two_osv_sources_stay_independent_requests(self) -> None:
+        rows = {
+            row["scope"]["source"]: row
+            for row in self.catalog.list_exemptions()
+            if row["scope"]["vulnerability"] == "CVE-SHARED"
+            and row["scope"]["name"] == "lib"
+        }
+        self.assertEqual(set(rows), {None, "nvd", "ghsa"})
+        self.assertEqual(rows[None]["id"], "R-MAN")
+        self.assertEqual(rows["nvd"]["id"], "R-NVD")
+        self.assertEqual(rows["ghsa"]["id"], "R-GHSA")
+        # Each keeps exactly its own processing path.
+        self.assertEqual(rows[None]["status"], "pending")
+        self.assertEqual(len(rows[None]["events"]), 1)
+        self.assertEqual(rows["nvd"]["status"], "approved")
+        self.assertEqual(
+            [e["action"] for e in rows["nvd"]["events"]],
+            ["request", "approve"],
+        )
+        self.assertEqual(rows["ghsa"]["status"], "rejected")
+        self.assertEqual(
+            [e["action"] for e in rows["ghsa"]["events"]],
+            ["request", "reject"],
+        )
+        # Filtering by one status still shows the same source-specific rows.
+        approved_nvd = self.catalog.list_exemptions(status="approved")
+        self.assertEqual(
+            [r["id"] for r in approved_nvd
+             if r["scope"]["vulnerability"] == "CVE-SHARED"],
+            ["R-NVD"],
+        )
+
+    def test_same_scope_old_expired_and_new_request_coexist(self) -> None:
+        rows = self.catalog.list_exemptions()
+        old = next(row for row in rows if row["id"] == "R-OLD")
+        new = next(row for row in rows if row["id"] == "R-NEW")
+        self.assertEqual(old["scope"], new["scope"])
+        # Identical scope does not merge content: distinct applicants'
+        # workflows, terms and histories stay attached to each id.
+        self.assertEqual(
+            old["expires_at"], "2026-02-01T00:00:00.000000Z"
+        )
+        self.assertEqual(
+            new["expires_at"], "2030-01-01T00:00:00.000000Z"
+        )
+        self.assertEqual(
+            [e["action"] for e in old["events"]], ["request", "approve"]
+        )
+        self.assertEqual([e["action"] for e in new["events"]], ["request"])
+
+    def test_expiry_does_not_rewrite_saved_approved_status(self) -> None:
+        # R-OLD is approved and its term has expired; listing by saved status
+        # still includes it under approved (and nowhere else).
+        approved_ids = [
+            row["id"]
+            for row in self.catalog.list_exemptions(status="approved")
+        ]
+        self.assertIn("R-OLD", approved_ids)
+        self.assertNotIn(
+            "R-OLD",
+            [row["id"]
+             for row in self.catalog.list_exemptions(status="pending")],
+        )
+        old = next(
+            row for row in self.catalog.list_exemptions(status="approved")
+            if row["id"] == "R-OLD"
+        )
+        self.assertEqual(old["status"], "approved")
+        self.assertEqual(old["approver"], "bob")
+        # The newer same-scope request is not displaced by the old record.
+        self.assertEqual(
+            [row["id"]
+             for row in self.catalog.list_exemptions(status="pending")],
+            ["R-NEW", "R-PEND", "R-MAN"],
+        )
+
+    def test_listing_adds_no_events_and_changes_nothing(self) -> None:
+        def snapshot():
+            return {
+                request_id: self.catalog.get_exemption(request_id)
+                for request_id in self.EXPECTED_ORDER
+            }
+
+        def event_count():
+            return self.catalog.connection.execute(
+                "SELECT COUNT(*) FROM exemption_events"
+            ).fetchone()[0]
+
+        before = snapshot()
+        events_before = event_count()
+        # Query repeatedly through every entry point; reads must be reads.
+        for status in self.STATUSES:
+            self.catalog.list_exemptions(status=status)
+            self.catalog.list_exemptions(status=status)
+        after = snapshot()
+        self.assertEqual(after, before)
+        self.assertEqual(event_count(), events_before)
+
+    def test_results_reproduce_after_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory, "catalog.db")
+            catalog = self.build_catalog(database)
+            expected = {
+                status: catalog.list_exemptions(status=status)
+                for status in self.STATUSES
+            }
+            catalog.close()
+
+            reopened = Catalog(database)
+            for status in self.STATUSES:
+                with self.subTest(status=status):
+                    self.assertEqual(
+                        reopened.list_exemptions(status=status),
+                        expected[status],
+                    )
+            reopened.close()
+
+
+class ExemptionListEmptyResultTests(unittest.TestCase):
+    def test_empty_catalog_returns_empty_list_for_every_filter(self) -> None:
+        catalog = Catalog()
+        for status in (None, "pending", "approved", "rejected", "revoked"):
+            with self.subTest(status=status):
+                self.assertEqual(catalog.list_exemptions(status=status), [])
+        catalog.close()
+
+    def test_status_without_matching_requests_returns_empty_list(self) -> None:
+        catalog = Catalog()
+        catalog.add_component("s", "pypi", "lib", "1.0.0")
+        catalog.add_vulnerability("CVE-1", "lib", "high")
+        catalog.request_exemption(
+            "R-1", "s", "pypi", "lib", "1.0.0", "CVE-1", "lib", None,
+            "alice", "reason", "2030-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(
+            [row["id"] for row in catalog.list_exemptions(status="pending")],
+            ["R-1"],
+        )
+        for status in ("approved", "rejected", "revoked"):
+            with self.subTest(status=status):
+                self.assertEqual(catalog.list_exemptions(status=status), [])
+        # The pending request survives the empty filtered queries untouched.
+        self.assertEqual(
+            len(catalog.get_exemption("R-1")["events"]), 1
+        )
+        catalog.close()
+
+
+class ExemptionListCliParityTests(unittest.TestCase):
+    """The CLI list and the Python query are the same feature end to end."""
+
+    STATUSES = (None, "pending", "approved", "rejected", "revoked")
+
+    @staticmethod
+    def build_catalog(database):
+        catalog = Catalog(database)
+        for name in ("app", "web", "lib"):
+            catalog.add_component("api", "pypi", name, "1.0.0")
+        catalog.add_dependency(
+            "api", "pypi", "web", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        catalog.add_vulnerability("CVE-MAN", "lib", "high")
+        catalog.import_osv(
+            "nvd",
+            [osv_record("CVE-OSV", package="lib", severity="low",
+                        versions=["1.0.0"])],
+        )
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        catalog.request_exemption(
+            "REQ-PEND", "api", "pypi", "lib", "1.0.0",
+            "CVE-MAN", "lib", None,
+            "alice", "pending reason", "2030-01-01T00:00:00+00:00",
+            submitted_at=base,
+        )
+        catalog.request_exemption(
+            "REQ-APPR", "api", "pypi", "lib", "1.0.0",
+            "CVE-OSV", "lib", "nvd",
+            "alice", "approved reason", "2026-02-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        catalog.approve_exemption(
+            "REQ-APPR", "bob", "approved note",
+            decided_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+        )
+        catalog.request_exemption(
+            "REQ-REJ", "api", "pypi", "web", "1.0.0",
+            "CVE-MAN", "lib", None,
+            "alice", "rejected reason", "2030-01-01T00:00:00+00:00",
+            submitted_at=datetime(2026, 1, 4, tzinfo=timezone.utc),
+        )
+        catalog.reject_exemption(
+            "REQ-REJ", "bob", "rejected note",
+            decided_at=datetime(2026, 1, 5, tzinfo=timezone.utc),
+        )
+        return catalog
+
+    def cli_list(self, database, status):
+        buffer = io.StringIO()
+        args = ["--database", str(database), "exemption-list"]
+        if status is not None:
+            args.extend(["--status", status])
+        with contextlib.redirect_stdout(buffer):
+            code = main(args)
+        self.assertEqual(code, 0)
+        return json.loads(buffer.getvalue())
+
+    def test_cli_and_python_return_identical_scopes_order_and_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory, "catalog.db")
+            catalog = self.build_catalog(database)
+            catalog.close()
+
+            for status in self.STATUSES:
+                with self.subTest(status=status):
+                    check = Catalog(database)
+                    self.assertEqual(
+                        self.cli_list(database, status),
+                        check.list_exemptions(status=status),
+                    )
+                    check.close()
+
+            # Spot-check the shared business rules through the CLI output.
+            unfiltered = self.cli_list(database, None)
+            self.assertEqual(
+                [row["id"] for row in unfiltered],
+                ["REQ-REJ", "REQ-APPR", "REQ-PEND"],
+            )
+            approved = self.cli_list(database, "approved")
+            self.assertEqual([row["id"] for row in approved], ["REQ-APPR"])
+            self.assertEqual(
+                [event["action"] for event in approved[0]["events"]],
+                ["request", "approve"],
+            )
+            self.assertEqual(
+                self.cli_list(database, "revoked"), []
+            )
+
+    def test_cli_rejects_illegal_status_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory, "catalog.db")
+            catalog = self.build_catalog(database)
+            catalog.close()
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as context:
+                    main([
+                        "--database", str(database),
+                        "exemption-list", "--status", "bogus",
+                    ])
+            # argparse rejects the choice before any business query runs.
+            self.assertEqual(context.exception.code, 2)
+
+            # The rejected command changed nothing; legal queries still work.
+            check = Catalog(database)
+            self.assertEqual(
+                [row["id"] for row in check.list_exemptions()],
+                ["REQ-REJ", "REQ-APPR", "REQ-PEND"],
             )
             check.close()
 
