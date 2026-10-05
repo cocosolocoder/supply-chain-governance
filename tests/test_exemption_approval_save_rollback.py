@@ -11,15 +11,16 @@ The business-rule failures (unknown id, non-pending state, expired term,
 applicant approving their own request, target impact gone at approval time)
 all reject *before* either write. These tests cover the other half of the
 contract: a request whose every approval precondition holds, and that then
-hits a database write error in one of the two save phases -
+hits a database error in one of the three save phases -
 
 1. saving the decision result (``UPDATE exemption_requests``);
-2. saving the approval history (``INSERT INTO exemption_events``).
+2. saving the approval history (``INSERT INTO exemption_events``);
+3. the final commit that makes the decision and its history durable.
 
-A failure in either phase must roll the whole approval back atomically. The
-request must never be left showing as approved while its history is missing,
-and the risk report must never have deducted the risk without a complete
-approval behind it. Concretely, after either failure:
+A failure in any of the three phases must roll the whole approval back
+atomically. The request must never be left showing as approved while its
+history is missing, and the risk report must never have deducted the risk
+without a complete approval behind it. Concretely, after any such failure:
 
 * the call raises a database error, never returns an approved record;
 * the request is still ``pending`` with its scope, applicant, reason,
@@ -223,8 +224,8 @@ def event_actions(catalog, request_id):
     ]
 
 
-class ApprovalSaveFailureRollbackTests(unittest.TestCase):
-    """A save error in either phase fails the approval atomically."""
+class _ApprovalStateAssertions:
+    """Post-failure contract checks shared by the rollback test classes."""
 
     def _assert_target_still_pristine_pending(self, catalog, snapshot):
         # The failed call must never be readable back as an approved record.
@@ -352,6 +353,10 @@ class ApprovalSaveFailureRollbackTests(unittest.TestCase):
             ),
             "other_request": catalog.get_exemption(OTHER_REQUEST_ID),
         }
+
+
+class ApprovalSaveFailureRollbackTests(_ApprovalStateAssertions, unittest.TestCase):
+    """A save error in either write phase fails the approval atomically."""
 
     def _run_failure_scenario(self, phase, trigger):
         with tempfile.TemporaryDirectory() as directory:
@@ -501,6 +506,161 @@ class ApprovalSaveFailureRollbackTests(unittest.TestCase):
         self._run_failure_scenario(
             "history-save", HISTORY_SAVE_FAILURE_TRIGGER
         )
+
+
+class FinalCommitFailureRollbackTests(_ApprovalStateAssertions, unittest.TestCase):
+    """A database error at the final COMMIT fails the approval atomically.
+
+    The decision UPDATE and the approval-history INSERT have both run inside
+    the write transaction when SQLite rejects the commit itself - the case
+    named in the contract is a file database whose writer lock is momentarily
+    held by another read connection (SQLITE_BUSY). Until the commit succeeds
+    those writes are only an open, uncommitted transaction: on the same
+    connection they would otherwise read back as a completed approval that
+    never became durable, and the connection would stay unable to commit
+    anything until it was closed and reopened. The commit phase therefore
+    needs the same rollback protection as the two statement phases.
+    """
+
+    def _open_blocking_reader(self, database):
+        """Hold a SHARED read lock that blocks the writer's COMMIT upgrade.
+
+        A SHARED lock coexists with the approval transaction's RESERVED lock,
+        so the BEGIN/UPDATE/INSERT phases all run; only the final upgrade to
+        an EXCLUSIVE lock at COMMIT is rejected with SQLITE_BUSY - exactly
+        the file-database-held-by-a-reader scenario. The short busy timeouts
+        only bound how long the failed commit waits; the lock stays held
+        until the test releases it, so the result is deterministic.
+        """
+        reader = sqlite3.connect(database)
+        reader.execute("PRAGMA busy_timeout = 50")
+        reader.execute("BEGIN")
+        reader.execute(
+            "SELECT COUNT(*) FROM exemption_requests"
+        ).fetchone()
+        return reader
+
+    def test_final_commit_failure_rolls_back_and_catalog_stays_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory, "catalog.db"))
+            catalog = build_catalog(database)
+            catalog.connection.execute("PRAGMA busy_timeout = 50")
+            snapshot = self._take_snapshot(catalog)
+
+            reader = self._open_blocking_reader(database)
+            statements = []
+            catalog.connection.set_trace_callback(statements.append)
+            try:
+                with self.assertRaises(sqlite3.Error) as caught:
+                    catalog.approve_exemption(
+                        REQUEST_ID, APPROVER, APPROVAL_NOTE,
+                        decided_at=DECIDED_AT,
+                    )
+            finally:
+                catalog.connection.set_trace_callback(None)
+
+            # The original database error reaches the caller, never an
+            # approved record and never a business-rule ValueError.
+            self.assertEqual(type(caught.exception), sqlite3.OperationalError)
+            self.assertNotIsInstance(caught.exception, ValueError)
+            self.assertEqual(str(caught.exception), "database is locked")
+
+            normalized = [s.strip() for s in statements]
+            self.assertIn("BEGIN IMMEDIATE", normalized)
+            # Both save statements ran inside the transaction; the failure is
+            # specifically the durability step that follows them.
+            self.assertTrue(
+                any(s.startswith("UPDATE exemption_requests") for s in normalized)
+            )
+            self.assertTrue(
+                any(s.startswith("INSERT INTO exemption_events") for s in normalized)
+            )
+            commit_index = normalized.index("COMMIT")
+            rollback_indexes = [
+                index for index, statement in enumerate(normalized)
+                if statement == "ROLLBACK"
+            ]
+            # COMMIT was attempted, rejected, and then rolled back.
+            self.assertTrue(rollback_indexes)
+            self.assertGreater(min(rollback_indexes), commit_index)
+
+            # No half-open transaction is left behind on the same connection.
+            self.assertFalse(catalog.connection.in_transaction)
+
+            # Using the very same Catalog object: pristine pending request,
+            # the other source's request untouched, and the report byte-for-
+            # byte identical to before the failed approval. These reads run
+            # while the blocking reader still holds its lock.
+            self._assert_target_still_pristine_pending(catalog, snapshot)
+            self._assert_other_request_untouched(catalog)
+            self._assert_report_keeps_pre_approval_result(catalog, snapshot)
+            self.assertEqual(
+                catalog.get_exemption(OTHER_REQUEST_ID),
+                snapshot["other_request"],
+            )
+            reader.rollback()
+            reader.close()
+
+            # Durable rollback through a freshly opened file database.
+            reopened = Catalog(database)
+            self._assert_target_still_pristine_pending(reopened, snapshot)
+            self._assert_other_request_untouched(reopened)
+            self._assert_report_keeps_pre_approval_result(reopened, snapshot)
+            reopened.close()
+
+            # Once the database accepts writes again, the ORIGINAL directory
+            # object keeps working - it must not require close/reopen to shed
+            # the failed approval - and a retry saves the complete approval,
+            # adding exactly one approve event.
+            approved = catalog.approve_exemption(
+                REQUEST_ID, APPROVER, APPROVAL_NOTE, decided_at=DECIDED_AT
+            )
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["approver"], APPROVER)
+            self.assertEqual(approved["decision_note"], APPROVAL_NOTE)
+            self.assertEqual(approved["approved_severity"], "high")
+            self.assertEqual(
+                approved["decided_at"], format_timestamp(DECIDED_AT)
+            )
+            self.assertEqual(
+                [event["action"] for event in approved["events"]],
+                ["request", "approve"],
+            )
+            self.assertEqual(
+                [event["seq"] for event in approved["events"]], [1, 2]
+            )
+
+            # The report moves together with the successful approval: the
+            # requested indirect impact is exempted, the other source's same-
+            # id record stays pending/unexempted, and the direct library hit
+            # was never part of this scope.
+            report = catalog.risk_report(service=SERVICE, evaluated_at=EVAL_AT)
+            target = find_entry(report, "app", SOURCE)
+            self.assertTrue(target["exempted"])
+            self.assertEqual(target["exemption_request"], REQUEST_ID)
+            self.assertIsNone(target["not_exempt_reason"])
+            other_indirect = find_entry(report, "app", OTHER_SOURCE)
+            self.assertFalse(other_indirect["exempted"])
+            self.assertEqual(
+                other_indirect["exemption_request"], OTHER_REQUEST_ID
+            )
+            direct = find_entry(report, "lib", SOURCE)
+            self.assertFalse(direct["exempted"])
+            self.assertEqual(report["impact_count"], 4)
+            self.assertEqual(report["unhandled_component_count"], 2)
+            self.assertEqual(report["highest_severity"], "high")
+            self._assert_other_request_untouched(catalog)
+
+            catalog.close()
+            durable = Catalog(database)
+            self.assertEqual(
+                durable.get_exemption(REQUEST_ID), approved
+            )
+            self.assertEqual(
+                durable.risk_report(service=SERVICE, evaluated_at=EVAL_AT),
+                report,
+            )
+            durable.close()
 
 
 class BusinessRejectionContrastTests(unittest.TestCase):

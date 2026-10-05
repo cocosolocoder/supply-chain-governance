@@ -994,7 +994,19 @@ class Catalog:
             self.connection.rollback()
             raise
         else:
-            self.connection.commit()
+            # The write phase succeeded, but persisting it is itself part of
+            # the save: a commit error (e.g. the file database is momentarily
+            # held by another read connection, SQLITE_BUSY) can still arrive
+            # here. Without this rollback the connection keeps the open,
+            # uncommitted transaction, so the very same Catalog object would
+            # read the decision back as if it had completed and could not be
+            # reused until it was closed and reopened. Roll the partial save
+            # back and surface the original database error to the caller.
+            try:
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
 
     def add_component(
         self, service: str, ecosystem: str, name: str, version: str
