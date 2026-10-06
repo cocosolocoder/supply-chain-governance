@@ -1008,6 +1008,35 @@ class Catalog:
                 self.connection.rollback()
                 raise
 
+    @contextmanager
+    def _read_snapshot(self):
+        """A consistent read snapshot spanning several statements.
+
+        Outside a transaction every SELECT runs in its own autocommit
+        read, so a report built from several queries could observe
+        different committed states when another process replaces a source
+        in between — e.g. new dependency edges over the old component
+        list. Bracketing the reads in one transaction pins them to a
+        single database state: a concurrent update is either seen whole
+        or not at all, never mixed into the same report.
+
+        A caller-managed transaction is left untouched: reads inside it
+        already see one consistent state including the caller's own
+        uncommitted changes, and the report must never commit or roll
+        back work it does not own. The transaction opened here is
+        read-only and always rolled back — also when a query fails (e.g.
+        an unparseable component version) — so the report never modifies
+        catalog data and the same Catalog object stays usable afterwards.
+        """
+        if self.connection.in_transaction:
+            yield
+            return
+        self.connection.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self.connection.rollback()
+
     def add_component(
         self, service: str, ecosystem: str, name: str, version: str
     ) -> None:
@@ -2677,13 +2706,19 @@ class Catalog:
 
         # Build impacts within the selected service only: same-name components,
         # dependencies and exemptions of other services never enter the report,
-        # and an unparseable version elsewhere cannot fail this service.
-        records = self._impact_records(scope_service)
+        # and an unparseable version elsewhere cannot fail this service. All
+        # reads — components, dependencies, manual and OSV vulnerabilities and
+        # the exemption requests below — run inside one snapshot, so a source
+        # replaced concurrently is either seen whole or not at all and the
+        # graph, the hit conditions and the linked approvals always belong to
+        # the same directory state.
+        with self._read_snapshot():
+            records = self._impact_records(scope_service)
 
-        # Every exemption request is read once up front (scoped to the
-        # selected service, exactly like the impact graph), so request data
-        # is no longer queried once per output record.
-        active, latest = self._scope_exemption_links(moment, scope_service)
+            # Every exemption request is read once up front (scoped to the
+            # selected service, exactly like the impact graph), so request data
+            # is no longer queried once per output record.
+            active, latest = self._scope_exemption_links(moment, scope_service)
         reported: list[dict] = []
         unexempted_components: set[tuple] = set()
         highest: str | None = None
