@@ -443,6 +443,199 @@ before/after status, and the result is saved together with its history. Two
 processes processing the same request concurrently produce at most one state
 change.
 
+### Browsing saved requests (`exemption-list`)
+
+`exemption-list` returns the saved requests as JSON — the inventory
+counterpart to the single-request `exemption-show`. With no argument it
+returns every saved request; `--status` filters by the status stored on the
+request:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db exemption-list
+python3 -m supply_guard.cli --database catalog.db exemption-list --status pending
+python3 -m supply_guard.cli --database catalog.db exemption-list --status approved
+python3 -m supply_guard.cli --database catalog.db exemption-list --status rejected
+python3 -m supply_guard.cli --database catalog.db exemption-list --status revoked
+```
+
+The filter compares against the **saved** status, and a status changes only
+through `approve-exemption`, `reject-exemption` or `revoke-exemption`.
+Reaching the expiry instant never rewrites a saved status: an expired
+approval stays `approved`, and a request whose term ended while pending stays
+`pending`. The `approved` view is therefore an audit list of requests that
+*were* approved — it still contains approvals whose term has ended, and it
+must not be read as the list of exemptions **currently in force**. To tell
+whether a current impact is actually exempted, use `risk-report`, which
+evaluates the term at the evaluation instant and also checks revocation, the
+approved severity scope and whether the impact still exists.
+
+Records are ordered by submission instant (`created_at`), newest first;
+requests submitted at the same instant tie-break by request id ascending.
+Approvals, rejections and revocations never reorder the list — with or
+without `--status`, only the submission instant and the id decide position.
+
+Every listed record has exactly the shape `exemption-show <id>` returns: the
+full seven-field `scope`, applicant, reason, `created_at`, `expires_at`,
+current `status`, the decision fields (`decided_at`, `approver`,
+`decision_note`, `approved_severity`), the revocation fields and the complete
+`events` history. Filtering selects whole requests and never trims a selected
+request's history — an approved-then-revoked request found under
+`--status revoked` still carries its submission and approval events — and a
+list record for an id matches `exemption-show` for that id field for field.
+
+The scope, not the vulnerability id alone, identifies a request: component
+service/ecosystem/**name/version**, the vulnerability id, the **matched
+package name** and the vulnerability **source** together distinguish
+requests. The same CVE id aimed at another component version, another matched
+package or another source is a different request that needs its own
+submission; `source: null` means a manually registered vulnerability, while a
+name such as `"nvd"` means an imported OSV record.
+
+Listing is strictly read-only: it never approves, rejects or revokes, never
+extends a term, never re-checks the current impact and never adds a history
+event.
+
+#### Example: an expired approval and a newer pending request for the same scope
+
+In January, alice requests an exemption for `api/pypi/lib 1.0.0` hit by
+manually registered vulnerability `CVE-2026-7000`; bob approves it with a
+term ending 2026-06-30. After the term ends, alice submits a renewal under a
+**new id**; in October it is still pending:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db request-exemption \
+    EXM-2026-010 api pypi lib 1.0.0 CVE-2026-7000 lib \
+    --applicant alice --reason "mitigated by egress proxy" \
+    --expires-at 2026-06-30T00:00:00+00:00
+python3 -m supply_guard.cli --database catalog.db approve-exemption \
+    EXM-2026-010 --handler bob --note "controls verified; term ends 2026-06-30"
+# ...the term ends on 2026-06-30; a renewal is then submitted under a new id:
+python3 -m supply_guard.cli --database catalog.db request-exemption \
+    EXM-2026-011 api pypi lib 1.0.0 CVE-2026-7000 lib \
+    --applicant alice --reason "renew: egress proxy still in place" \
+    --expires-at 2030-01-01T00:00:00+00:00
+```
+
+The unfiltered list shows both, newest submission first — the pending
+renewal leads and the expired approval follows (abridged; the other decision
+and revocation fields are present as `null`):
+
+```bash
+python3 -m supply_guard.cli --database catalog.db exemption-list
+```
+
+```json
+[
+  {
+    "id": "EXM-2026-011",
+    "scope": {"service": "api", "ecosystem": "pypi", "name": "lib",
+              "version": "1.0.0", "vulnerability": "CVE-2026-7000",
+              "matched_name": "lib", "source": null},
+    "applicant": "alice",
+    "reason": "renew: egress proxy still in place",
+    "created_at": "2026-10-01T03:00:00.000000Z",
+    "expires_at": "2030-01-01T00:00:00.000000Z",
+    "status": "pending",
+    "events": [
+      {"seq": 1, "at": "2026-10-01T03:00:00.000000Z", "actor": "alice",
+       "action": "request", "reason": "renew: egress proxy still in place",
+       "from_status": null, "to_status": "pending"}
+    ]
+  },
+  {
+    "id": "EXM-2026-010",
+    "scope": {"service": "api", "ecosystem": "pypi", "name": "lib",
+              "version": "1.0.0", "vulnerability": "CVE-2026-7000",
+              "matched_name": "lib", "source": null},
+    "applicant": "alice",
+    "reason": "mitigated by egress proxy",
+    "created_at": "2026-01-10T09:00:00.000000Z",
+    "expires_at": "2026-06-30T00:00:00.000000Z",
+    "status": "approved",
+    "approver": "bob",
+    "decision_note": "controls verified; term ends 2026-06-30",
+    "approved_severity": "high",
+    "events": [
+      {"seq": 1, "at": "2026-01-10T09:00:00.000000Z", "actor": "alice",
+       "action": "request", "reason": "mitigated by egress proxy",
+       "from_status": null, "to_status": "pending"},
+      {"seq": 2, "at": "2026-01-12T14:00:00.000000Z", "actor": "bob",
+       "action": "approve",
+       "reason": "controls verified; term ends 2026-06-30",
+       "from_status": "pending", "to_status": "approved"}
+    ]
+  }
+]
+```
+
+The two status views find the requests by their saved status, and each record
+keeps its own complete history:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db exemption-list --status approved
+# [{"id": "EXM-2026-010", "status": "approved",
+#   "expires_at": "2026-06-30T00:00:00.000000Z", "events": [request, approve]}]
+python3 -m supply_guard.cli --database catalog.db exemption-list --status pending
+# [{"id": "EXM-2026-011", "status": "pending",
+#   "expires_at": "2030-01-01T00:00:00.000000Z", "events": [request]}]
+```
+
+How to read this:
+
+- **Why the old record is still under `approved`:** expiry never changes a
+  saved status. Only a decision moves a request between statuses; nothing
+  revoked `EXM-2026-010`, so it keeps `status: "approved"` with its approval
+  event and its ended term. It is an expired *approval record*, not an active
+  exemption.
+- **Why that does not mean the impact is exempted today.** Evaluated on
+  2026-10-07, `risk-report` answers for the present: the term of
+  `EXM-2026-010` has ended and `EXM-2026-011` is still pending, so the impact
+  is reported unexempted and linked to the request that currently occupies
+  the scope:
+
+```json
+{
+  "vulnerability": "CVE-2026-7000",
+  "source": null,
+  "severity": "high",
+  "exempted": false,
+  "exemption_request": "EXM-2026-011",
+  "not_exempt_reason": "豁免申请尚在待审批"
+}
+```
+
+- **The new request supplements the old one; it never overwrites it.** The
+  two rows share the same seven-field scope but have different ids, terms,
+  careers and histories: `EXM-2026-010` keeps `request` + `approve`, while
+  `EXM-2026-011` carries only its own `request`. `exemption-show
+  EXM-2026-010` returns exactly the record the list shows for that id, and
+  the same holds for `EXM-2026-011`; no event of one request ever appears on
+  the other. The old id stays queryable for audit even though its expiry
+  released the scope for the renewal.
+
+#### Empty results and illegal status values
+
+A database with no requests, and a status no saved request currently has,
+both print an empty JSON array — a normal, successful result:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db exemption-list
+# []
+python3 -m supply_guard.cli --database catalog.db exemption-list --status rejected
+# []
+```
+
+An illegal status value is not an empty result: the command rejects the
+argument before querying, exits non-zero and leaves stored data untouched.
+Note that `expired` is deliberately not offered — expiry is a term fact that
+`risk-report` evaluates, not a saved status:
+
+```bash
+python3 -m supply_guard.cli --database catalog.db exemption-list --status expired
+# error: argument --status: invalid choice: 'expired'
+#   (choose from 'pending', 'approved', 'rejected', 'revoked')   (exit 2)
+```
+
 ## Risk report
 
 `risk-report` emits JSON over the **current** impacts — directory (SBOM),
