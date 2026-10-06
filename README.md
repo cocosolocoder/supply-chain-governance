@@ -443,6 +443,21 @@ before/after status, and the result is saved together with its history. Two
 processes processing the same request concurrently produce at most one state
 change.
 
+`exemption-list` (and `Catalog.list_exemptions`) reads the selected requests
+and their processing history from one consistent database snapshot, so the
+whole list — membership, the current status, the decision/revocation note and
+the attached history — always reflects a single saved state. When another
+process approves, rejects, revokes or submits while the list is being read,
+the list may show either the state just before that save or the state just
+after it, but never a mixture: an old status row never loses its history or
+gains the newer event, and a request entering or leaving the filtered status
+mid-read never causes a missing, mismatched or foreign history entry (or a
+query error). A later query sees the completed processing. The read never
+writes; inside a caller-managed transaction it reports what that transaction
+can see and leaves committing or rolling back to the caller, and a database
+error while reading fails the whole query instead of returning half a list,
+with the connection still usable afterwards.
+
 ## Risk report
 
 `risk-report` emits JSON over the **current** impacts — directory (SBOM),

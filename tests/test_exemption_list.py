@@ -32,11 +32,20 @@ Guarantees covered here:
   identical before and after, with no extra history events;
 * CLI and Python are the same feature: the same scopes, order and history;
 * an illegal CLI status value keeps being rejected.
+
+A final class pins the concurrent contract: another process saving an
+approval, rejection, revocation or a brand-new request while a list is
+reading must never split one saved state across the request read and the
+history read — membership, status, notes and history always come from the
+same instant; a read error aborts the whole list; and a caller-managed
+transaction (including its uncommitted writes) is respected instead of
+committed or rolled back by the query.
 """
 
 import contextlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -877,6 +886,425 @@ class CliParityTests(unittest.TestCase):
                              "--status", status])
             self.assertEqual(code, 0)
             self.assertTrue(stdout2.getvalue().strip().startswith("["))
+
+
+class ConcurrentSnapshotTests(unittest.TestCase):
+    """Content, status, notes and history always come from one saved instant.
+
+    Another process saving an approval, rejection, revocation or a brand-new
+    request while the list is reading must never split a single saved state
+    across the request selection and the history read. The interleave is
+    reproduced deterministically: the database runs in WAL so a second
+    connection can commit while this connection keeps a snapshot open, and a
+    trace callback fires the competing save at the exact statement that used
+    to be the second, independent read.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name, "catalog.db"))
+        self.catalog = Catalog(self.database)
+        # WAL is what makes the read-commit-read interleaving possible: a
+        # concurrent writer commits while the list connection holds its read
+        # snapshot. In the default rollback journal that scenario is simply
+        # blocked, so WAL is required to exercise the snapshot contract.
+        self.catalog.connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        for name in ("app", "web", "lib"):
+            self.catalog.add_component("api", "pypi", name, "1.0.0")
+        self.catalog.add_dependency(
+            "api", "pypi", "app", "1.0.0", "api", "pypi", "web", "1.0.0"
+        )
+        self.catalog.add_dependency(
+            "api", "pypi", "web", "1.0.0", "api", "pypi", "lib", "1.0.0"
+        )
+        self.catalog.add_vulnerability("CVE-MAN", "lib", "high")
+        self.future = "2030-01-01T00:00:00+00:00"
+
+    def tearDown(self) -> None:
+        self.catalog.close()
+        self.directory.cleanup()
+
+    def request(self, catalog, request_id, submitted_at=None, **overrides):
+        values = dict(
+            request_id=request_id,
+            service="api",
+            ecosystem="pypi",
+            name="lib",
+            version="1.0.0",
+            vulnerability="CVE-MAN",
+            matched_name="lib",
+            source=None,
+            applicant="alice",
+            reason="mitigated",
+            expires_at=self.future,
+        )
+        values.update(overrides)
+        if submitted_at is not None:
+            values["submitted_at"] = submitted_at
+        return catalog.request_exemption(**values)
+
+    def writer_catalog(self) -> Catalog:
+        writer = Catalog(self.database)
+        self.addCleanup(writer.close)
+        return writer
+
+    def list_with_save_between_reads(self, write_action, status):
+        """Run the list while another process saves between its two reads.
+
+        The competing write commits immediately before the history read is
+        executed - the exact boundary where application content and history
+        used to come from two different saved states.
+        """
+        writer = self.writer_catalog()
+        fired = []
+
+        def tracer(statement: str) -> None:
+            if not fired and "exemption_events AS e" in statement:
+                fired.append(True)
+                write_action(writer)
+
+        self.catalog.connection.set_trace_callback(tracer)
+        try:
+            result = self.catalog.list_exemptions(status=status)
+        finally:
+            self.catalog.connection.set_trace_callback(None)
+        self.assertTrue(fired, "交错必须恰好发生在历史读取语句之前")
+        return result
+
+    @staticmethod
+    def assertRecordCoherent(testcase, record, status, actions):
+        """Status, notes and history describe one and the same saved state."""
+        testcase.assertEqual(record["status"], status)
+        event_actions = [event["action"] for event in record["events"]]
+        testcase.assertEqual(event_actions, actions)
+        # History always starts with the request, at the submission instant.
+        testcase.assertEqual(record["events"][0]["action"], "request")
+        testcase.assertEqual(record["events"][0]["at"], record["created_at"])
+        # The final history transition lands exactly on the displayed
+        # status; an old row attached to newer history fails this pairing.
+        testcase.assertEqual(record["events"][-1]["to_status"], status)
+        for earlier, later in zip(record["events"], record["events"][1:]):
+            testcase.assertEqual(later["from_status"], earlier["to_status"])
+
+    def test_approval_between_reads_keeps_pending_view_at_old_state(self) -> None:
+        self.request(self.catalog, "REQ-A", submitted_at=T1)
+        self.request(self.catalog, "REQ-P", name="web", matched_name="lib",
+                     submitted_at=T2)
+        rows = self.list_with_save_between_reads(
+            lambda w: w.approve_exemption("REQ-A", "bob", "approve note"),
+            status="pending",
+        )
+        # Pinned before the save: REQ-A is still selected, still pending, and
+        # carries no approval residue; the other pending row is unaffected.
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(set(by_id), {"REQ-A", "REQ-P"})
+        self.assertRecordCoherent(self, by_id["REQ-A"], "pending", ["request"])
+        self.assertIsNone(by_id["REQ-A"]["decision_note"])
+        self.assertIsNone(by_id["REQ-A"]["approver"])
+        self.assertRecordCoherent(self, by_id["REQ-P"], "pending", ["request"])
+        # A later query sees the completed approval whole.
+        self.assertEqual(
+            [row["id"] for row in self.catalog.list_exemptions(status="pending")],
+            ["REQ-P"],
+        )
+        approved = {
+            row["id"]: row
+            for row in self.catalog.list_exemptions(status="approved")
+        }
+        self.assertEqual(set(approved), {"REQ-A"})
+        self.assertEqual(
+            [event["action"] for event in approved["REQ-A"]["events"]],
+            ["request", "approve"],
+        )
+        self.assertEqual(approved["REQ-A"]["decision_note"], "approve note")
+
+    def test_rejection_between_reads_keeps_pending_view_at_old_state(self) -> None:
+        self.request(self.catalog, "REQ-R", submitted_at=T1)
+        rows = self.list_with_save_between_reads(
+            lambda w: w.reject_exemption("REQ-R", "bob", "reject note"),
+            status="pending",
+        )
+        (record,) = rows
+        self.assertRecordCoherent(self, record, "pending", ["request"])
+        self.assertIsNone(record["decision_note"])
+        later = {
+            row["id"]: row
+            for row in self.catalog.list_exemptions(status="rejected")
+        }
+        self.assertEqual(set(later), {"REQ-R"})
+        self.assertEqual(
+            [event["action"] for event in later["REQ-R"]["events"]],
+            ["request", "reject"],
+        )
+
+    def test_revocation_between_reads_keeps_approved_view_at_old_state(
+        self,
+    ) -> None:
+        self.request(self.catalog, "REQ-V", submitted_at=T1)
+        self.catalog.approve_exemption("REQ-V", "bob", "approve note")
+        rows = self.list_with_save_between_reads(
+            lambda w: w.revoke_exemption("REQ-V", "carol", "revoke note"),
+            status="approved",
+        )
+        (record,) = rows
+        self.assertRecordCoherent(
+            self, record, "approved", ["request", "approve"]
+        )
+        self.assertEqual(record["decision_note"], "approve note")
+        self.assertIsNone(record["revoke_note"])
+        later = {
+            row["id"]: row
+            for row in self.catalog.list_exemptions(status="revoked")
+        }
+        self.assertEqual(set(later), {"REQ-V"})
+        self.assertEqual(
+            [event["action"] for event in later["REQ-V"]["events"]],
+            ["request", "approve", "revoke"],
+        )
+        self.assertEqual(
+            self.catalog.list_exemptions(status="approved"), []
+        )
+
+    def test_unfiltered_list_never_mixes_old_row_with_new_history(self) -> None:
+        self.request(self.catalog, "REQ-A", submitted_at=T1)
+        rows = self.list_with_save_between_reads(
+            lambda w: w.approve_exemption("REQ-A", "bob", "approve note"),
+            status=None,
+        )
+        # Pre-decision snapshot: still pending, decision note absent, and the
+        # approve event is not grafted onto the old row.
+        (record,) = rows
+        self.assertRecordCoherent(self, record, "pending", ["request"])
+        self.assertIsNone(record["decision_note"])
+        self.assertIsNone(record["approver"])
+
+        # A subsequent unfiltered query sees the saved approval as a whole.
+        later = {row["id"]: row for row in self.catalog.list_exemptions()}
+        self.assertEqual(later["REQ-A"]["status"], "approved")
+        self.assertEqual(later["REQ-A"]["decision_note"], "approve note")
+        self.assertEqual(
+            [event["action"] for event in later["REQ-A"]["events"]],
+            ["request", "approve"],
+        )
+
+    def test_request_entering_selection_between_reads_cannot_break_list(
+        self,
+    ) -> None:
+        # A second request enters the pending selection while the list reads.
+        # The old second read then returned an event for an id the first read
+        # never selected, which made list construction fail outright; and in
+        # unfiltered views its event could attach to nothing.
+        self.request(self.catalog, "REQ-P", submitted_at=T1)
+
+        def submit(writer: Catalog) -> None:
+            self.request(
+                writer, "REQ-NEW", name="web", matched_name="lib",
+                submitted_at=T2,
+            )
+
+        rows = self.list_with_save_between_reads(submit, status="pending")
+        # Pinned to the pre-save snapshot: the request that entered
+        # mid-read is neither listed nor has its history pulled in.
+        self.assertEqual([row["id"] for row in rows], ["REQ-P"])
+        self.assertRecordCoherent(self, rows[0], "pending", ["request"])
+
+        later = self.catalog.list_exemptions(status="pending")
+        self.assertEqual([row["id"] for row in later], ["REQ-NEW", "REQ-P"])
+        self.assertEqual(
+            [event["action"] for event in later[0]["events"]], ["request"]
+        )
+
+    def test_request_entering_approved_view_between_reads_is_wholesale(
+        self,
+    ) -> None:
+        # Symmetric entering case for the approved view: a decision lands
+        # while that view is reading. A second, already approved request
+        # makes sure the history read still runs; the snapshot may exclude
+        # the new request (pre-save) or include it together with both its
+        # events, but never include it with history stripped.
+        self.request(self.catalog, "REQ-KEPT", name="web", matched_name="lib",
+                     submitted_at=T1)
+        self.catalog.approve_exemption("REQ-KEPT", "bob", "kept note")
+        self.request(self.catalog, "REQ-A", submitted_at=T2)
+
+        rows = self.list_with_save_between_reads(
+            lambda w: w.approve_exemption("REQ-A", "bob", "approve note"),
+            status="approved",
+        )
+        # Read began before the save: only the previously approved request
+        # is in the snapshot; the new approval is not half-present.
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual(set(by_id), {"REQ-KEPT"})
+        self.assertRecordCoherent(
+            self, by_id["REQ-KEPT"], "approved", ["request", "approve"]
+        )
+        # The completed approval is visible to the very next query, with
+        # its full history.
+        later = {
+            row["id"]: row
+            for row in self.catalog.list_exemptions(status="approved")
+        }
+        self.assertEqual(set(later), {"REQ-KEPT", "REQ-A"})
+        self.assertEqual(
+            [event["action"] for event in later["REQ-A"]["events"]],
+            ["request", "approve"],
+        )
+        self.assertEqual(later["REQ-A"]["decision_note"], "approve note")
+
+    def _raw_exemption_state(self):
+        requests = [
+            tuple(row)
+            for row in self.catalog.connection.execute(
+                "SELECT * FROM exemption_requests ORDER BY id"
+            )
+        ]
+        events = [
+            tuple(row)
+            for row in self.catalog.connection.execute(
+                "SELECT request_id, seq, occurred_at, actor, action, reason, "
+                "from_status, to_status FROM exemption_events "
+                "ORDER BY request_id, seq"
+            )
+        ]
+        return requests, events
+
+    def _deny_reads_of(self, table: str):
+        def authorizer(kind, arg1, _arg2, _db, _source):
+            if kind == sqlite3.SQLITE_READ and arg1 == table:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        self.catalog.connection.set_authorizer(authorizer)
+
+    def test_database_error_on_either_read_reports_failure_and_stays_usable(
+        self,
+    ) -> None:
+        self.request(self.catalog, "REQ-P", submitted_at=T1)
+        self.request(self.catalog, "REQ-A", name="web", matched_name="lib",
+                     submitted_at=T2)
+        self.catalog.approve_exemption("REQ-A", "bob", "ok")
+        for failing_table in ("exemption_requests", "exemption_events"):
+            with self.subTest(failing_read=failing_table):
+                before = self._raw_exemption_state()
+                self._deny_reads_of(failing_table)
+                try:
+                    for status in (None, "pending", "approved"):
+                        with self.assertRaises(sqlite3.Error):
+                            self.catalog.list_exemptions(status=status)
+                        # The failed read never leaves an open transaction
+                        # behind on the shared connection.
+                        self.assertFalse(
+                            self.catalog.connection.in_transaction
+                        )
+                finally:
+                    self.catalog.connection.set_authorizer(None)
+                # No half list, no writes: the same connection keeps serving
+                # complete results and the stored data is untouched.
+                self.assertEqual(self._raw_exemption_state(), before)
+                self.assertEqual(
+                    [row["id"] for row in
+                     self.catalog.list_exemptions(status="pending")],
+                    ["REQ-P"],
+                )
+
+    def _insert_uncommitted_request(self, request_id="REQ-TX") -> None:
+        self.catalog.connection.execute("BEGIN")
+        self.catalog.connection.execute(
+            """
+            INSERT INTO exemption_requests(
+                id, service, ecosystem, name, version, vulnerability,
+                matched_name, source, created_at, applicant, reason,
+                expires_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id, "api", "pypi", "app", "1.0.0", "CVE-MAN", "lib",
+                None, "2026-05-01T00:00:00.000000Z", "alice", "uncommitted",
+                "2030-01-01T00:00:00.000000Z", "pending",
+            ),
+        )
+        self.catalog.connection.execute(
+            """
+            INSERT INTO exemption_events(
+                request_id, seq, occurred_at, actor, action, reason,
+                from_status, to_status
+            ) VALUES (?, 1, ?, ?, 'request', ?, NULL, 'pending')
+            """,
+            (
+                request_id, "2026-05-01T00:00:00.000000Z", "alice",
+                "uncommitted",
+            ),
+        )
+
+    def test_list_inside_caller_transaction_uses_caller_visible_state(self) -> None:
+        self.request(self.catalog, "REQ-P", submitted_at=T1)
+        self._insert_uncommitted_request()
+        self.assertTrue(self.catalog.connection.in_transaction)
+        try:
+            for status in (None, "pending"):
+                with self.subTest(status=status):
+                    rows = self.catalog.list_exemptions(status=status)
+                    self.assertIn("REQ-TX", [row["id"] for row in rows])
+                    tx_row = next(row for row in rows if row["id"] == "REQ-TX")
+                    self.assertEqual(tx_row["status"], "pending")
+                    self.assertEqual(
+                        [event["action"] for event in tx_row["events"]],
+                        ["request"],
+                    )
+                    # The query neither committed nor rolled the caller's
+                    # transaction back.
+                    self.assertTrue(
+                        self.catalog.connection.in_transaction
+                    )
+            # Another connection still cannot see the uncommitted request.
+            other = sqlite3.connect(self.database)
+            self.addCleanup(other.close)
+            self.assertEqual(
+                other.execute(
+                    "SELECT COUNT(*) FROM exemption_requests WHERE id = 'REQ-TX'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            self.catalog.connection.rollback()
+        self.assertFalse(self.catalog.connection.in_transaction)
+        # The caller rolled back; later queries no longer include REQ-TX and
+        # the connection works normally.
+        self.assertEqual(
+            [row["id"] for row in self.catalog.list_exemptions()],
+            ["REQ-P"],
+        )
+
+    def test_read_error_inside_caller_transaction_preserves_caller_tx(self) -> None:
+        self.request(self.catalog, "REQ-P", submitted_at=T1)
+        self._insert_uncommitted_request()
+        self._deny_reads_of("exemption_events")
+        try:
+            with self.assertRaises(sqlite3.Error):
+                self.catalog.list_exemptions(status="pending")
+            # The caller's transaction is still open with its writes intact;
+            # the query must not have committed or rolled it back.
+            self.assertTrue(self.catalog.connection.in_transaction)
+            self.assertEqual(
+                self.catalog.connection.execute(
+                    "SELECT reason FROM exemption_requests WHERE id = 'REQ-TX'"
+                ).fetchone()[0],
+                "uncommitted",
+            )
+            other = sqlite3.connect(self.database)
+            self.addCleanup(other.close)
+            self.assertEqual(
+                other.execute(
+                    "SELECT COUNT(*) FROM exemption_requests WHERE id = 'REQ-TX'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            self.catalog.connection.set_authorizer(None)
+            self.catalog.connection.rollback()
+        self.assertEqual(
+            [row["id"] for row in self.catalog.list_exemptions(status="pending")],
+            ["REQ-P"],
+        )
 
 
 if __name__ == "__main__":
