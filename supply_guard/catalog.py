@@ -1751,16 +1751,32 @@ class Catalog:
                     queue.append(dependent)
         return affected
 
-    def _affected_ids(
+    def _summary_from_graph(
         self,
-    ) -> tuple[dict[int, dict[str, str]], set[int]]:
-        components, _, reverse, direct_groups = self._impact_graph()
-        return components, self._affected_ids_from_groups(
-            direct_groups, reverse
-        )
+        components: dict[int, dict[str, str]],
+        reverse: dict[int, list[int]],
+        direct_groups: dict[tuple[str | None, str, str], dict[int, dict]],
+    ) -> tuple[Summary, set[int]]:
+        """Build the summary figures from one already-loaded graph snapshot.
 
-    def summary(self) -> Summary:
-        _, _, reverse, direct_groups = self._impact_graph()
+        Every input (components, reverse edges, direct-hit groups) was read
+        inside the caller's read snapshot, and the component total below is
+        queried through that very same snapshot, so the total component
+        count, the directly and transitively affected count, the
+        deduplicated vulnerability count and the highest risk are always
+        taken from one single database state. A source another process
+        replaces in between two statements can therefore never make the
+        summary pair an old directory's two affected components with a new
+        empty directory's zero total. Returns the :class:`Summary` together
+        with the affected component ids, so a caller that also needs the
+        affected-service list derives both from the same snapshot.
+
+        The counting rules are unchanged: manual observations count
+        separately; imported vulnerabilities count only when they hit a
+        component and deduplicate by (id, normalized package) across
+        sources; the highest risk spans every hit; exemptions never reduce
+        these raw impact figures.
+        """
         affected = self._affected_ids_from_groups(direct_groups, reverse)
 
         # Manual observations and OSV hits share the direct-hit model; only
@@ -1784,6 +1800,8 @@ class Catalog:
                     detail["severity"] for detail in terminals.values()
                 )
 
+        # Same snapshot as the graph reads above: the total belongs to the
+        # same committed state as the affected set, never a later one.
         row = self.connection.execute(
             "SELECT COUNT(*) AS components FROM components"
         ).fetchone()
@@ -1793,24 +1811,83 @@ class Catalog:
             if highest is None or SEVERITY_RANK[severity] > SEVERITY_RANK[highest]:
                 highest = severity
 
-        return Summary(
-            components=int(row["components"]),
-            affected_components=len(affected),
-            vulnerabilities=len(manual_severities) + len(osv_pairs),
-            highest_severity=highest,
+        return (
+            Summary(
+                components=int(row["components"]),
+                affected_components=len(affected),
+                vulnerabilities=len(manual_severities) + len(osv_pairs),
+                highest_severity=highest,
+            ),
+            affected,
         )
 
-    def affected_services(self) -> list[str]:
-        components, affected = self._affected_ids()
-        # The affected ids all come from the already loaded component map, so
-        # the distinct service names are derived in memory: no query binds one
-        # parameter per affected component, and a large manifest cannot hit
-        # SQLite's bound-parameter limit. Sorting by the service string gives
-        # the same order the previous ORDER BY service produced (both compare
-        # text by code point).
+    @staticmethod
+    def _services_of(
+        components: dict[int, dict[str, str]], affected: set[int]
+    ) -> list[str]:
+        """The distinct affected services, sorted by their text.
+
+        The affected ids all come from the already loaded component map, so
+        the distinct service names are derived in memory: no query binds one
+        parameter per affected component, and a large manifest cannot hit
+        SQLite's bound-parameter limit. Sorting by the service string gives
+        the same order the previous ORDER BY service produced (both compare
+        text by code point).
+        """
         return sorted(
             {components[component_id]["service"] for component_id in affected}
         )
+
+    def summary(self) -> Summary:
+        """Return the directory summary as of one consistent database state.
+
+        All reads run inside one read snapshot, so the total component count,
+        affected-component count, vulnerability count and highest risk always
+        describe the same committed state even while another process replaces
+        a source; a concurrent update is seen whole or not at all. A
+        caller-managed transaction is used as-is (its own uncommitted changes
+        are visible) and is never committed or rolled back; with no caller
+        transaction the snapshot is read-only and always released, including
+        when a component version cannot be parsed.
+        """
+        with self._read_snapshot():
+            components, _, reverse, direct_groups = self._impact_graph()
+            summary, _ = self._summary_from_graph(
+                components, reverse, direct_groups
+            )
+        return summary
+
+    def summary_with_services(self) -> tuple[Summary, list[str]]:
+        """Return the summary and its affected services from one snapshot.
+
+        This is the single backing query of the CLI summary: the figures and
+        the service list are computed inside the same read snapshot, so the
+        highest risk and the affected services can never disagree (an old
+        ``high`` paired with an empty service list is impossible). The
+        service sorting and the ``Summary`` shape are identical to
+        :meth:`summary` and :meth:`affected_services`.
+        """
+        with self._read_snapshot():
+            components, _, reverse, direct_groups = self._impact_graph()
+            summary, affected = self._summary_from_graph(
+                components, reverse, direct_groups
+            )
+            services = self._services_of(components, affected)
+        return summary, services
+
+    def affected_services(self) -> list[str]:
+        """Return the sorted services with at least one affected component.
+
+        The graph, the hit groups and the affected-service list are read in
+        one snapshot, so the result always belongs to the same state a
+        concurrent :meth:`summary` reports. Caller-transaction and
+        read-only/release semantics are the same as :meth:`summary`.
+        """
+        with self._read_snapshot():
+            components, _, reverse, direct_groups = self._impact_graph()
+            affected = self._affected_ids_from_groups(direct_groups, reverse)
+            services = self._services_of(components, affected)
+        return services
 
     def impact(
         self,

@@ -106,8 +106,14 @@ def parser() -> argparse.ArgumentParser:
 
 
 def render_summary(catalog: Catalog) -> str:
-    summary = catalog.summary()
-    services = catalog.affected_services()
+    # The figures and the service list come from one shared read snapshot
+    # (Catalog.summary_with_services), so the whole Chinese summary - total
+    # and affected component counts, vulnerability count, highest risk and
+    # affected services - always answers for a single database state even
+    # while another process replaces a source; it never stitches an old
+    # highest risk to a new, empty affected-service list. A component version
+    # that cannot be compared raises here, before any line is printed.
+    summary, services = catalog.summary_with_services()
     return "\n".join(
         [
             "软件供应链治理摘要",
