@@ -2364,11 +2364,28 @@ class Catalog:
 
         Whatever the status filter (or lack of one), the requests and the
         complete histories attached to the result are read with a fixed
-        number of queries: one read selects the matching request rows, and
-        one more read loads the history of exactly those requests. The
-        history read is scoped to the selected ids, so filtering by status
-        never pulls other requests' history in, and the number of reads no
-        longer grows with the number of returned requests.
+        number of queries against one fixed saved state: a read snapshot
+        spans the row selection and the history read, so both reads can
+        only observe the same instant. A decision another process saves
+        in between (approve/reject/revoke, saved together with its
+        history event) is therefore seen either wholly or not at all —
+        never a selected request with its history dropped, an old status
+        paired with a newer decision event, or a failure when some other
+        request enters or leaves the filtered status between the two
+        reads. Reflecting the pre-save state is a valid result; a later
+        list sees the completed save.
+
+        The snapshot is read-only and always rolled back: listing never
+        writes, never adds history, and never commits or rolls back a
+        transaction the caller opened — inside a caller transaction the
+        reads simply share that transaction's view (including its own
+        uncommitted changes). A database error from either read is
+        propagated instead of yielding a half-built list, and the same
+        connection stays usable afterwards.
+
+        The history read stays scoped to the selected ids, so filtering
+        by status never pulls other requests' history in, and the number
+        of reads does not grow with the number of returned requests.
         """
         query = (
             "SELECT * FROM exemption_requests "
@@ -2376,34 +2393,43 @@ class Catalog:
             + "ORDER BY created_at DESC, id ASC"
         )
         parameters: tuple = () if status is None else (status,)
-        rows = self.connection.execute(query, parameters).fetchall()
-        histories: dict[str, list[dict]] = {str(row["id"]): [] for row in rows}
-        if histories:
-            # Join against the same selection rather than binding one
-            # placeholder per id: this stays a single read with the same one
-            # (or zero) status parameter however many requests match, so a
-            # large list cannot overflow SQLite's bound-parameter limit, and
-            # only the selected requests' events are read.
-            event_rows = self.connection.execute(
-                """
-                SELECT e.request_id, e.seq, e.occurred_at, e.actor, e.action,
-                       e.reason, e.from_status, e.to_status
-                FROM exemption_events AS e
-                JOIN (
-                    SELECT id FROM exemption_requests
-                """
-                + ("WHERE status = ? " if status is not None else "")
-                + """
-                ) AS r ON r.id = e.request_id
-                ORDER BY e.request_id, e.seq
-                """,
-                parameters,
-            )
-            for event in event_rows:
-                histories[str(event["request_id"])].append(self._event_dict(event))
-        return [
-            self._request_dict(row, histories[str(row["id"])]) for row in rows
-        ]
+        with self._read_snapshot():
+            rows = self.connection.execute(query, parameters).fetchall()
+            histories: dict[str, list[dict]] = {
+                str(row["id"]): [] for row in rows
+            }
+            if histories:
+                # Join against the same selection rather than binding one
+                # placeholder per id: this stays a single read with the same
+                # one (or zero) status parameter however many requests match,
+                # so a large list cannot overflow SQLite's bound-parameter
+                # limit, and only the selected requests' events are read. The
+                # surrounding snapshot guarantees the subquery evaluates the
+                # same state as the row selection, so every attached event
+                # belongs to a request selected at that same instant.
+                event_rows = self.connection.execute(
+                    """
+                    SELECT e.request_id, e.seq, e.occurred_at, e.actor,
+                           e.action, e.reason, e.from_status, e.to_status
+                    FROM exemption_events AS e
+                    JOIN (
+                        SELECT id FROM exemption_requests
+                    """
+                    + ("WHERE status = ? " if status is not None else "")
+                    + """
+                    ) AS r ON r.id = e.request_id
+                    ORDER BY e.request_id, e.seq
+                    """,
+                    parameters,
+                ).fetchall()
+                for event in event_rows:
+                    histories[str(event["request_id"])].append(
+                        self._event_dict(event)
+                    )
+            return [
+                self._request_dict(row, histories[str(row["id"])])
+                for row in rows
+            ]
 
     def _process_decision(
         self,

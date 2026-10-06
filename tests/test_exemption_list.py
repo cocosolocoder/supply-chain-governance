@@ -31,13 +31,24 @@ Guarantees covered here:
 * listing mutates nothing — statuses, decision info and histories are
   identical before and after, with no extra history events;
 * CLI and Python are the same feature: the same scopes, order and history;
-* an illegal CLI status value keeps being rejected.
+* an illegal CLI status value keeps being rejected;
+* another process saving a decision (status and its history event together)
+  while a list is being read can never produce a mixed list: the request
+  selection and every attached history come from one saved instant, whether
+  or not a status filter is given — no selected request with missing
+  history, no old status paired with a newer event, and no error when some
+  other request enters or leaves the filtered status between reads;
+* inside a caller-owned transaction the list shares that transaction's view
+  (including uncommitted changes) without committing or rolling it back,
+  and a read failure surfaces as a database error, never a half list.
 """
 
 import contextlib
 import io
 import json
+import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -726,6 +737,325 @@ class ListDoesNotMutateTests(ExemptionListFixture):
             first = self.catalog.list_exemptions(status=status)
             second = self.catalog.list_exemptions(status=status)
             self.assertEqual(first, second)
+
+
+class ConcurrentListSnapshotTests(unittest.TestCase):
+    """A list read while another process saves a decision stays consistent.
+
+    The other process is a second Catalog connection on the same file
+    database that runs a full decision save (status row and its history
+    event in one committed transaction). It starts while the list's first
+    read is underway; the writer's commit waits for the list's read
+    snapshot to finish, so the list must return one saved instant whole —
+    never a request selected from the old state with its history dropped,
+    an old status stitched to a newer event, or a failure because another
+    request entered the filtered status mid-read.
+    """
+
+    def _new_run(self):
+        """A fresh seeded file database and Catalog for one concurrent run.
+
+        The file runs in WAL mode so a reader holding a snapshot never blocks
+        a writer's commit: the concurrent decision can be forced to land
+        strictly between the list's two reads without deadlocking, while a
+        correctly opened read transaction still pins both reads to one
+        database instant.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = str(Path(directory.name, "catalog.db"))
+        catalog = Catalog(database)
+        self.addCleanup(catalog.close)
+        catalog.connection.execute("PRAGMA journal_mode=WAL")
+        catalog.add_component("api", "pypi", "lib", "1.0.0")
+        catalog.add_vulnerability("CVE-MAN", "lib", "high")
+        catalog.add_vulnerability("CVE-OTHER", "lib", "high")
+        return catalog, database
+
+    @staticmethod
+    def _request(catalog, request_id, vulnerability="CVE-MAN"):
+        return catalog.request_exemption(
+            request_id, "api", "pypi", "lib", "1.0.0",
+            vulnerability, "lib", None,
+            applicant="alice",
+            reason=f"reason {request_id}",
+            expires_at="2030-01-01T00:00:00+00:00",
+        )
+
+    def _start_concurrent_save(self, catalog, database, request_id, decision):
+        """Force one complete decision save between the list's two reads.
+
+        A trace barrier releases the writer only as the list's second SELECT
+        (the history read) is about to start — after the request-row SELECT
+        has finished — and the list does not continue until that save
+        commits. In WAL the writer's commit is not blocked by the reader, so
+        this is a deterministic inter-read race: with separate per-statement
+        reads the two reads straddle the save; with one read snapshot both
+        reads are pinned to the same instant. Any save error is recorded and
+        asserted afterwards.
+        """
+        proceed = threading.Event()
+        committed = threading.Event()
+        errors: list[BaseException] = []
+
+        def save() -> None:
+            proceed.wait(30)
+            other = Catalog(database)
+            try:
+                if decision == "approve":
+                    other.approve_exemption(request_id, "bob", "concurrent")
+                elif decision == "reject":
+                    other.reject_exemption(request_id, "bob", "concurrent")
+                else:
+                    other.revoke_exemption(request_id, "carol", "concurrent")
+            except BaseException as exc:  # report any save failure
+                errors.append(exc)
+            finally:
+                other.close()
+                committed.set()
+
+        thread = threading.Thread(target=save)
+        thread.start()
+
+        seen = {"selects": 0}
+
+        def barrier(sql) -> None:
+            if sql.lstrip().upper().startswith("SELECT"):
+                seen["selects"] += 1
+                if seen["selects"] == 2:
+                    catalog.connection.set_trace_callback(None)
+                    proceed.set()
+                    committed.wait(30)
+
+        catalog.connection.set_trace_callback(barrier)
+        return thread, committed, errors
+
+    def _assert_save_landed(self, thread, committed, errors) -> None:
+        self.assertTrue(committed.wait(15), "并发处理未能在两次读取之间提交")
+        thread.join()
+        self.assertEqual(errors, [])
+
+    def _run_filtered_while_selected_request_is_decided(self, decision) -> None:
+        catalog, database = self._new_run()
+        self._request(catalog, "REQ-1")
+
+        thread, finished, errors = self._start_concurrent_save(
+            catalog, database, "REQ-1", decision
+        )
+        rows = catalog.list_exemptions(status="pending")
+        # The list never waits on the other save; once it returns its
+        # snapshot is released and the save can land.
+        self.assertFalse(catalog.connection.in_transaction)
+        self._assert_save_landed(thread, finished, errors)
+
+        # Pre-save view: still selected as pending, with the COMPLETE history
+        # of that instant — the submission, never an empty list and never the
+        # other save's decision event.
+        self.assertEqual([row["id"] for row in rows], ["REQ-1"])
+        self.assertEqual(rows[0]["status"], "pending")
+        self.assertIsNone(rows[0]["decision_note"])
+        self.assertEqual(
+            [event["action"] for event in rows[0]["events"]], ["request"]
+        )
+
+        # A follow-up query sees the completed, saved processing.
+        self.assertEqual(catalog.list_exemptions(status="pending"), [])
+        (decided,) = catalog.list_exemptions(
+            status="approved" if decision == "approve" else "rejected"
+        )
+        self.assertEqual(
+            [event["action"] for event in decided["events"]],
+            ["request", decision],
+        )
+
+    def test_filtered_list_keeps_full_history_when_selected_request_approved(
+        self,
+    ) -> None:
+        self._run_filtered_while_selected_request_is_decided("approve")
+
+    def test_filtered_list_keeps_full_history_when_selected_request_rejected(
+        self,
+    ) -> None:
+        self._run_filtered_while_selected_request_is_decided("reject")
+
+    def test_unfiltered_list_does_not_mix_old_status_with_new_event(self) -> None:
+        catalog, database = self._new_run()
+        self._request(catalog, "REQ-1")
+
+        thread, finished, errors = self._start_concurrent_save(
+            catalog, database, "REQ-1", "approve"
+        )
+        rows = catalog.list_exemptions()
+        self._assert_save_landed(thread, finished, errors)
+
+        self.assertEqual([row["id"] for row in rows], ["REQ-1"])
+        self.assertEqual(rows[0]["status"], "pending")
+        self.assertIsNone(rows[0]["decision_note"])
+        # The old pending status must never be paired with the new approve
+        # event: the whole row reflects the pre-save instant.
+        self.assertEqual(
+            [event["action"] for event in rows[0]["events"]], ["request"]
+        )
+
+        after = {row["id"]: row for row in catalog.list_exemptions()}
+        self.assertEqual(after["REQ-1"]["status"], "approved")
+        self.assertEqual(after["REQ-1"]["decision_note"], "concurrent")
+        self.assertEqual(
+            [event["action"] for event in after["REQ-1"]["events"]],
+            ["request", "approve"],
+        )
+
+    def test_request_entering_filtered_status_between_reads_does_not_break_list(
+        self,
+    ) -> None:
+        catalog, database = self._new_run()
+        # REQ-1 is approved already (so the filtered selection is non-empty);
+        # REQ-2 is pending on a distinct scope and becomes approved while the
+        # list is reading. The snapshot must keep REQ-2 out without erroring.
+        self._request(catalog, "REQ-1")
+        catalog.approve_exemption("REQ-1", "bob", "first")
+        self._request(catalog, "REQ-2", vulnerability="CVE-OTHER")
+
+        thread, finished, errors = self._start_concurrent_save(
+            catalog, database, "REQ-2", "approve"
+        )
+        rows = catalog.list_exemptions(status="approved")
+        self._assert_save_landed(thread, finished, errors)
+
+        self.assertEqual([row["id"] for row in rows], ["REQ-1"])
+        self.assertEqual(rows[0]["status"], "approved")
+        self.assertEqual(
+            [event["action"] for event in rows[0]["events"]],
+            ["request", "approve"],
+        )
+
+        # Once the save is visible, both approved requests are listed, each
+        # with only its own history.
+        later = {row["id"]: row for row in
+                 catalog.list_exemptions(status="approved")}
+        self.assertEqual(set(later), {"REQ-1", "REQ-2"})
+        self.assertEqual(
+            [event["action"] for event in later["REQ-1"]["events"]],
+            ["request", "approve"],
+        )
+        self.assertEqual(
+            [event["action"] for event in later["REQ-2"]["events"]],
+            ["request", "approve"],
+        )
+
+    def test_revoke_landing_mid_list_keeps_one_consistent_saved_state(
+        self,
+    ) -> None:
+        catalog, database = self._new_run()
+        # REQ-1 is approved with an unexpired term; a concurrent revoke
+        # commits during the list. Either instant is acceptable, but status,
+        # note and history must agree.
+        self._request(catalog, "REQ-1")
+        catalog.approve_exemption("REQ-1", "bob", "first")
+
+        thread, finished, errors = self._start_concurrent_save(
+            catalog, database, "REQ-1", "revoke"
+        )
+        rows = catalog.list_exemptions()
+        self._assert_save_landed(thread, finished, errors)
+        self.assertEqual([row["id"] for row in rows], ["REQ-1"])
+        row = rows[0]
+        if row["status"] == "approved":
+            self.assertIsNone(row["revoke_note"])
+            self.assertEqual(
+                [event["action"] for event in row["events"]],
+                ["request", "approve"],
+            )
+        else:
+            self.assertEqual(row["status"], "revoked")
+            self.assertEqual(row["revoke_note"], "concurrent")
+            self.assertEqual(
+                [event["action"] for event in row["events"]],
+                ["request", "approve", "revoke"],
+            )
+
+
+class ListTransactionAndFailureTests(ExemptionListFixture):
+    """Caller transactions are respected and read errors surface cleanly."""
+
+    def test_list_inside_caller_transaction_sees_its_uncommitted_rows(self) -> None:
+        self.request("REQ-1")
+        connection = self.catalog.connection
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                """
+                INSERT INTO exemption_requests(
+                    id, service, ecosystem, name, version, vulnerability,
+                    matched_name, source, created_at, applicant, reason,
+                    expires_at, status
+                ) VALUES (
+                    'REQ-TMP', 'api', 'pypi', 'web', '1.0.0', 'CVE-MAN',
+                    'lib', NULL, '2026-09-01T00:00:00.000000Z', 'alice',
+                    'uncommitted', '2030-09-01T00:00:00.000000Z', 'pending'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO exemption_events(
+                    request_id, seq, occurred_at, actor, action, reason,
+                    from_status, to_status
+                ) VALUES (
+                    'REQ-TMP', 1, '2026-09-01T00:00:00.000000Z', 'alice',
+                    'request', 'uncommitted', NULL, 'pending'
+                )
+                """
+            )
+            rows = {row["id"]: row for row in self.catalog.list_exemptions()}
+            self.assertIn("REQ-TMP", rows)
+            # The caller's own uncommitted request and history are visible.
+            self.assertEqual(
+                [event["action"] for event in rows["REQ-TMP"]["events"]],
+                ["request"],
+            )
+            # The query must not end, commit or roll back the caller's tx.
+            self.assertTrue(connection.in_transaction)
+        finally:
+            connection.rollback()
+        self.assertNotIn(
+            "REQ-TMP",
+            {row["id"] for row in self.catalog.list_exemptions()},
+        )
+
+    def test_read_error_fails_the_list_but_leaves_a_usable_catalog(self) -> None:
+        self.request("REQ-1")
+        armed = {"select_started": False, "fired": False}
+
+        def arm(sql) -> None:
+            normalized = " ".join(sql.split()).upper()
+            if normalized.startswith("SELECT * FROM EXEMPTION_REQUESTS"):
+                armed["select_started"] = True
+
+        def interrupt_once() -> int:
+            if armed["select_started"] and not armed["fired"]:
+                armed["fired"] = True
+                self.catalog.connection.interrupt()
+            return 0
+
+        connection = self.catalog.connection
+        connection.set_trace_callback(arm)
+        connection.set_progress_handler(interrupt_once, 1)
+        try:
+            with self.assertRaises(sqlite3.Error):
+                self.catalog.list_exemptions()
+        finally:
+            connection.set_progress_handler(None, 0)
+            connection.set_trace_callback(None)
+
+        # No half-open snapshot transaction is left, the same connection is
+        # still usable, and no data or history was altered by the failed read.
+        self.assertFalse(connection.in_transaction)
+        (record,) = self.catalog.list_exemptions()
+        self.assertEqual(record["id"], "REQ-1")
+        self.assertEqual(
+            [event["action"] for event in record["events"]], ["request"]
+        )
 
 
 class CliParityTests(unittest.TestCase):
