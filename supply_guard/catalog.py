@@ -1907,19 +1907,37 @@ class Catalog:
                     "service is required when filtering by component identity"
                 )
 
-        if all(value is not None for value in identity_filter):
-            # A full identity resolves exactly one component; the lookup,
-            # closure-bounded propagation and record construction are the
-            # single shared computation the exemption checks also run, so
-            # this query can never disagree with a request/approval check.
-            records = self._target_impact_records(
-                service, ecosystem, name, version
-            )
-        else:
-            # Build the graph within the service scope up front, so components
-            # of other services never take part in OSV version matching or
-            # dependency propagation.
-            records = self._impact_records(service)
+        # Every read below — components, dependency edges, manual and OSV
+        # vulnerability rows and, for a full-identity query, the target
+        # existence lookup and its forward-closure traversal — runs inside one
+        # read snapshot. Outside a transaction each SELECT is its own autocommit
+        # read, so a source another process replaces between them could stitch
+        # states together: the old component list with the new empty edge set
+        # keeps a library's direct hit but drops the component that depended on
+        # it, and a target resolved only after the commit vanishes mid-query and
+        # turns impacts that existed in the old directory into a false empty
+        # list. One snapshot pins the whole answer — directory-wide,
+        # service-scoped or full identity — to a single committed state (the
+        # state before or after a concurrent replacement, never a mixture). A
+        # caller-managed transaction is shared as-is (its own uncommitted
+        # changes are visible and never committed or rolled back here); a
+        # self-opened snapshot is read-only and always released, including when
+        # a component version cannot be parsed, so the same Catalog stays usable
+        # afterwards and later reads observe completed source updates.
+        with self._read_snapshot():
+            if all(value is not None for value in identity_filter):
+                # A full identity resolves exactly one component; the lookup,
+                # closure-bounded propagation and record construction are the
+                # single shared computation the exemption checks also run, so
+                # this query can never disagree with a request/approval check.
+                records = self._target_impact_records(
+                    service, ecosystem, name, version
+                )
+            else:
+                # Build the graph within the service scope up front, so components
+                # of other services never take part in OSV version matching or
+                # dependency propagation.
+                records = self._impact_records(service)
 
         records.sort(key=_impact_sort_key)
         return records
