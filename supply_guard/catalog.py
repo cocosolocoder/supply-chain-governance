@@ -1896,6 +1896,31 @@ class Catalog:
         name: str | None = None,
         version: str | None = None,
     ) -> list[dict]:
+        """Return the impact records as of one consistent database state.
+
+        An answer combines several reads — components, dependency edges,
+        manual and OSV vulnerability records and, for a full-identity query,
+        the target's own existence lookup. Without one read snapshot another
+        process replacing an SBOM or OSV source in between those reads could
+        stitch the old directory's components and edges to the new source's
+        vulnerability conditions (or the reverse), or — for the identity
+        query — resolve a target that the source replacement just removed
+        against the old graph and falsely report the old directory's impact
+        as empty. Every read here therefore shares one read snapshot: a
+        concurrent replacement is seen whole or not at all, so the result is
+        either the complete pre-update impact (a directly hit library
+        together with everything that depends on it) or the complete
+        post-update impact (an empty list), never a mixture and never an
+        internal error over a half-replaced graph.
+
+        A transaction the caller opened is used as-is — the reads see its
+        own uncommitted changes and are never committed or rolled back; with
+        no caller transaction the snapshot is read-only and always released,
+        including when an OSV version comparison fails, so the same Catalog
+        object stays usable and a later independent query observes the
+        finished source update. The query never modifies components, sources
+        or exemption history.
+        """
         identity_filter = (ecosystem, name, version)
         if any(value is not None for value in identity_filter):
             if not all(value is not None for value in identity_filter):
@@ -1907,19 +1932,27 @@ class Catalog:
                     "service is required when filtering by component identity"
                 )
 
-        if all(value is not None for value in identity_filter):
-            # A full identity resolves exactly one component; the lookup,
-            # closure-bounded propagation and record construction are the
-            # single shared computation the exemption checks also run, so
-            # this query can never disagree with a request/approval check.
-            records = self._target_impact_records(
-                service, ecosystem, name, version
-            )
-        else:
-            # Build the graph within the service scope up front, so components
-            # of other services never take part in OSV version matching or
-            # dependency propagation.
-            records = self._impact_records(service)
+        # One snapshot spans the graph/hit reads and the target lookup: in
+        # particular the full-identity path loads the whole service graph
+        # before resolving the target, and the snapshot guarantees the
+        # target's existence and its dependency closure are judged against
+        # the very same directory state as the vulnerability hits, so a
+        # target removed mid-query can never be answered with the old impact
+        # falsely reported as empty.
+        with self._read_snapshot():
+            if all(value is not None for value in identity_filter):
+                # A full identity resolves exactly one component; the lookup,
+                # closure-bounded propagation and record construction are the
+                # single shared computation the exemption checks also run, so
+                # this query can never disagree with a request/approval check.
+                records = self._target_impact_records(
+                    service, ecosystem, name, version
+                )
+            else:
+                # Build the graph within the service scope up front, so components
+                # of other services never take part in OSV version matching or
+                # dependency propagation.
+                records = self._impact_records(service)
 
         records.sort(key=_impact_sort_key)
         return records
