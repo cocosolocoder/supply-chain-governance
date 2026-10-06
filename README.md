@@ -470,6 +470,29 @@ python3 -m supply_guard.cli --database catalog.db risk-report \
   queryable; if the same scope reappears while the approval, severity and
   term still hold, the exemption resumes. A changed dependency path does not
   change the scope — the report shows the latest path;
+- one report is always built against one coherent committed state: its
+  components, dependencies, manual observations, OSV source records and
+  exemption requests with their approval state are all read inside a single
+  read-only snapshot transaction. When another process replaces a source or
+  processes an exemption while a report is running, that write waits until
+  the report finishes, so the report is wholly the pre-update state or
+  wholly the post-update state — never a mixture. In particular, if a
+  replacement changes `app -> lib` into `app -> bridge -> lib`, a report
+  never explains the old component list with the new edges (and can never
+  fail on a path node missing from its state): the path is the complete
+  `app -> lib` or the complete `app -> bridge -> lib`, with every node, the
+  direct/indirect flag, the vulnerability source, the matched conditions and
+  the exemption decision all taken from that one state. `impact_count`,
+  `unhandled_component_count` and `highest_severity` are computed from the
+  returned impacts of that same snapshot, never from a newer state;
+- the snapshot is read-only: generating a report never modifies the
+  directory, vulnerability sources or exemption history. If a component
+  version has to be compared with an OSV record and cannot be parsed, the
+  error still names that component's full identity, the snapshot is
+  released, and the same catalog object remains usable for further queries
+  and updates. A report run while the caller's own transaction is still open
+  sees the caller's uncommitted changes without committing or rolling them
+  back;
 - output ordering is stable, and queries/reports never modify approval
   history; identical data and evaluation instant reproduce the same output
   after reopening the database.

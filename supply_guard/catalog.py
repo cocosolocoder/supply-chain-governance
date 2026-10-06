@@ -1008,6 +1008,49 @@ class Catalog:
                 self.connection.rollback()
                 raise
 
+    @contextmanager
+    def _read_snapshot(self):
+        """A read-only transaction pinning one consistent catalog snapshot.
+
+        A report reads the directory in several statements (components,
+        dependency edges, manual observations, OSV source records, exemption
+        requests). Without a surrounding transaction each statement takes the
+        newest committed state, so another process committing an SBOM/OSV
+        replacement or an exemption decision between two statements lets the
+        report explain one state's component list with another state's
+        dependency graph — a path can then reference a node the component map
+        no longer holds, or an old impact be linked against a newer approval.
+
+        ``BEGIN`` (deferred) keeps one read transaction open across every
+        report read. Its first statement acquires a SHARED lock that the
+        transaction holds until the report is complete, so a concurrent
+        writer's commit — which has to upgrade to an EXCLUSIVE lock — cannot
+        land between two report reads; it waits until the snapshot is
+        released and then commits. Every statement of the report therefore
+        observes the same last committed state, so the report is wholly
+        pre-update or wholly post-update; a commit that was already finishing
+        when the report began is wholly observed as post-update. Nothing is
+        ever written through it: the transaction ends with ``COMMIT`` on
+        success and ``ROLLBACK`` on error, both of which only release the
+        read lock and never change business data. When the caller already
+        owns a transaction — notably a report run inside a still-open
+        transaction of this same connection with uncommitted catalog changes
+        — that transaction is reused untouched, so the caller keeps seeing
+        its own changes and the report neither commits nor rolls them back.
+        """
+        if self.connection.in_transaction:
+            yield
+            return
+        self.connection.execute("BEGIN")
+        try:
+            yield
+        except Exception:
+            # Release the read lock; a read transaction rolls back no data.
+            self.connection.rollback()
+            raise
+        else:
+            self.connection.commit()
+
     def add_component(
         self, service: str, ecosystem: str, name: str, version: str
     ) -> None:
@@ -2675,83 +2718,95 @@ class Catalog:
             if not scope_service:
                 raise ValueError("service 不能为空")
 
-        # Build impacts within the selected service only: same-name components,
-        # dependencies and exemptions of other services never enter the report,
-        # and an unparseable version elsewhere cannot fail this service.
-        records = self._impact_records(scope_service)
+        # The whole report — component/dependency graph, manual observations,
+        # OSV source records and exemption requests with their approval state
+        # — is read through one snapshot transaction, so a replacement or
+        # decision committed by another process while the report is being
+        # built cannot make one read pre-update and the next post-update.
+        # The counts below are derived from these very records, so they can
+        # never be taken from a newer state either. ``moment`` only judges
+        # exemption terms against this snapshot; it never backdates the
+        # directory or approval state.
+        with self._read_snapshot():
+            # Build impacts within the selected service only: same-name
+            # components, dependencies and exemptions of other services never
+            # enter the report, and an unparseable version elsewhere cannot
+            # fail this service.
+            records = self._impact_records(scope_service)
 
-        # Every exemption request is read once up front (scoped to the
-        # selected service, exactly like the impact graph), so request data
-        # is no longer queried once per output record.
-        active, latest = self._scope_exemption_links(moment, scope_service)
-        reported: list[dict] = []
-        unexempted_components: set[tuple] = set()
-        highest: str | None = None
+            # Every exemption request is read once up front (scoped to the
+            # selected service, exactly like the impact graph), so request
+            # data is no longer queried once per output record.
+            active, latest = self._scope_exemption_links(moment, scope_service)
+            reported: list[dict] = []
+            unexempted_components: set[tuple] = set()
+            highest: str | None = None
 
-        for record in records:
-            component = record["component"]
-            # The scope a request must carry to link to this record is built
-            # by the same constructor submission uses, so stored scopes and
-            # report records can never drift apart. Dependency paths are not
-            # part of the scope: a changed path still links the same request.
-            scope = _scope_of_record(record)
-            entry = {
-                "component": dict(component),
-                "vulnerability": record["vulnerability"],
-                "source": record["source"],
-                "matched_name": record["matched_name"],
-                "severity": record["severity"],
-                "severity_basis": record["severity_basis"],
-                "direct": record["direct"],
-                "matched_conditions": record["matched_conditions"],
-                "path": [dict(node) for node in record["path"]],
-                "exempted": False,
-                "exemption_request": None,
-                "not_exempt_reason": None,
-            }
+            for record in records:
+                component = record["component"]
+                # The scope a request must carry to link to this record is
+                # built by the same constructor submission uses, so stored
+                # scopes and report records can never drift apart. Dependency
+                # paths are not part of the scope: a changed path still links
+                # the same request.
+                scope = _scope_of_record(record)
+                entry = {
+                    "component": dict(component),
+                    "vulnerability": record["vulnerability"],
+                    "source": record["source"],
+                    "matched_name": record["matched_name"],
+                    "severity": record["severity"],
+                    "severity_basis": record["severity_basis"],
+                    "direct": record["direct"],
+                    "matched_conditions": record["matched_conditions"],
+                    "path": [dict(node) for node in record["path"]],
+                    "exempted": False,
+                    "exemption_request": None,
+                    "not_exempt_reason": None,
+                }
 
-            exemption = active.get(scope)
-            if exemption is not None:
-                current_severity = str(record["severity"])
-                approved_rank = SEVERITY_RANK[exemption["approved_severity"]]
-                if SEVERITY_RANK[current_severity] > approved_rank:
-                    # The current rating exceeds what was approved: the
-                    # exemption no longer covers this record, but the
-                    # approval id stays linked instead of falling back to
-                    # "no request".
-                    entry["exemption_request"] = exemption["id"]
-                    entry["not_exempt_reason"] = (
-                        f"当前风险等级 {current_severity} 高于审批时的"
-                        f"{exemption['approved_severity']}，超出审批范围"
-                    )
+                exemption = active.get(scope)
+                if exemption is not None:
+                    current_severity = str(record["severity"])
+                    approved_rank = SEVERITY_RANK[exemption["approved_severity"]]
+                    if SEVERITY_RANK[current_severity] > approved_rank:
+                        # The current rating exceeds what was approved: the
+                        # exemption no longer covers this record, but the
+                        # approval id stays linked instead of falling back to
+                        # "no request".
+                        entry["exemption_request"] = exemption["id"]
+                        entry["not_exempt_reason"] = (
+                            f"当前风险等级 {current_severity} 高于审批时的"
+                            f"{exemption['approved_severity']}，超出审批范围"
+                        )
+                    else:
+                        entry["exempted"] = True
+                        entry["exemption_request"] = exemption["id"]
                 else:
-                    entry["exempted"] = True
-                    entry["exemption_request"] = exemption["id"]
-            else:
-                # No approval is in force for the scope: keep linking the
-                # newest request (with its pending/rejected/revoked/expired
-                # reason); an empty map entry still means no request exists.
-                linked = latest.get(scope)
-                if linked is not None:
-                    entry["exemption_request"] = linked["id"]
-                    entry["not_exempt_reason"] = linked["not_exempt_reason"]
+                    # No approval is in force for the scope: keep linking the
+                    # newest request (with its pending/rejected/revoked/expired
+                    # reason); an empty map entry still means no request exists.
+                    linked = latest.get(scope)
+                    if linked is not None:
+                        entry["exemption_request"] = linked["id"]
+                        entry["not_exempt_reason"] = linked["not_exempt_reason"]
 
-            if not entry["exempted"]:
-                unexempted_components.add(
-                    (
-                        component["service"], component["ecosystem"],
-                        component["name"], component["version"],
+                if not entry["exempted"]:
+                    unexempted_components.add(
+                        (
+                            component["service"], component["ecosystem"],
+                            component["name"], component["version"],
+                        )
                     )
-                )
-                if (
-                    highest is None
-                    or SEVERITY_RANK[record["severity"]] > SEVERITY_RANK[highest]
-                ):
-                    highest = str(record["severity"])
+                    if (
+                        highest is None
+                        or SEVERITY_RANK[record["severity"]] > SEVERITY_RANK[highest]
+                    ):
+                        highest = str(record["severity"])
 
-            reported.append(entry)
+                reported.append(entry)
 
-        reported.sort(key=_impact_sort_key)
+            reported.sort(key=_impact_sort_key)
 
         return {
             "evaluated_at": format_timestamp(moment),
