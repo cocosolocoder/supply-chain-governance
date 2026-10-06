@@ -106,8 +106,16 @@ def parser() -> argparse.ArgumentParser:
 
 
 def render_summary(catalog: Catalog) -> str:
-    summary = catalog.summary()
-    services = catalog.affected_services()
+    # The counts and the affected-service list must describe one database
+    # state: reading them in two independent rounds could straddle a source
+    # replacement committed by another process in between and print e.g. the
+    # old affected count next to the new service list. One shared read
+    # snapshot pins every line of the summary to the same committed state;
+    # it is read-only and rolled back, and a query error (e.g. an
+    # unparseable component version) propagates before anything is printed.
+    with catalog._read_snapshot():
+        summary = catalog.summary()
+        services = catalog.affected_services()
     return "\n".join(
         [
             "软件供应链治理摘要",

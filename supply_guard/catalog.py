@@ -1760,48 +1760,85 @@ class Catalog:
         )
 
     def summary(self) -> Summary:
-        _, _, reverse, direct_groups = self._impact_graph()
-        affected = self._affected_ids_from_groups(direct_groups, reverse)
+        """Current directory totals, all taken from one database state.
 
-        # Manual observations and OSV hits share the direct-hit model; only
-        # groups with at least one directly hit component participate.
-        manual_severities: list[str] = []
-        osv_pairs: set[tuple[str, str]] = set()
-        osv_severities: list[str] = []
-        for (source, identifier, matched_name), terminals in direct_groups.items():
-            if not terminals:
-                continue
-            if source is None:
-                # One manual vulnerability row per group; its severity is the
-                # same at every directly hit component.
-                manual_severities.append(next(iter(terminals.values()))["severity"])
-            else:
-                # Imported vulnerabilities are deduplicated by id and
-                # normalized package name across sources, and only records
-                # that actually hit a component count.
-                osv_pairs.add((identifier, matched_name))
-                osv_severities.extend(
-                    detail["severity"] for detail in terminals.values()
-                )
+        The component count, the affected-component count, the vulnerability
+        count and the highest severity always describe the same committed
+        state: every read — components, dependency edges, manual
+        observations, OSV records and the final count — runs inside one read
+        snapshot, so a source another process replaces in between is either
+        seen whole or not at all, never split across the numbers (e.g. the
+        new component total next to the old affected count).
 
-        row = self.connection.execute(
-            "SELECT COUNT(*) AS components FROM components"
-        ).fetchone()
+        The snapshot is read-only and always rolled back — also when a query
+        fails (e.g. an unparseable component version) — so the summary never
+        modifies catalog data and the same Catalog object stays usable
+        afterwards. Inside a caller-managed transaction the reads simply
+        share that transaction's view, including its own uncommitted
+        changes, and the summary never commits or rolls back work it does
+        not own.
+        """
+        with self._read_snapshot():
+            _, _, reverse, direct_groups = self._impact_graph()
+            affected = self._affected_ids_from_groups(direct_groups, reverse)
 
-        highest: str | None = None
-        for severity in manual_severities + osv_severities:
-            if highest is None or SEVERITY_RANK[severity] > SEVERITY_RANK[highest]:
-                highest = severity
+            # Manual observations and OSV hits share the direct-hit model;
+            # only groups with at least one directly hit component
+            # participate.
+            manual_severities: list[str] = []
+            osv_pairs: set[tuple[str, str]] = set()
+            osv_severities: list[str] = []
+            for (
+                source, identifier, matched_name
+            ), terminals in direct_groups.items():
+                if not terminals:
+                    continue
+                if source is None:
+                    # One manual vulnerability row per group; its severity is
+                    # the same at every directly hit component.
+                    manual_severities.append(
+                        next(iter(terminals.values()))["severity"]
+                    )
+                else:
+                    # Imported vulnerabilities are deduplicated by id and
+                    # normalized package name across sources, and only
+                    # records that actually hit a component count.
+                    osv_pairs.add((identifier, matched_name))
+                    osv_severities.extend(
+                        detail["severity"] for detail in terminals.values()
+                    )
 
-        return Summary(
-            components=int(row["components"]),
-            affected_components=len(affected),
-            vulnerabilities=len(manual_severities) + len(osv_pairs),
-            highest_severity=highest,
-        )
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS components FROM components"
+            ).fetchone()
+
+            highest: str | None = None
+            for severity in manual_severities + osv_severities:
+                if (
+                    highest is None
+                    or SEVERITY_RANK[severity] > SEVERITY_RANK[highest]
+                ):
+                    highest = severity
+
+            return Summary(
+                components=int(row["components"]),
+                affected_components=len(affected),
+                vulnerabilities=len(manual_severities) + len(osv_pairs),
+                highest_severity=highest,
+            )
 
     def affected_services(self) -> list[str]:
-        components, affected = self._affected_ids()
+        """Services with at least one affected component, sorted by name.
+
+        The component map, the dependency edges and the vulnerability hits
+        are read inside one snapshot (the same read-only, always-rolled-back
+        snapshot :meth:`summary` uses), so the service list always
+        corresponds to a single database state and never mixes components
+        from before a concurrent source replacement with hits from after
+        it.
+        """
+        with self._read_snapshot():
+            components, affected = self._affected_ids()
         # The affected ids all come from the already loaded component map, so
         # the distinct service names are derived in memory: no query binds one
         # parameter per affected component, and a large manifest cannot hit
