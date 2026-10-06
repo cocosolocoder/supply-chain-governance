@@ -2432,9 +2432,35 @@ class Catalog:
         }
 
     def get_exemption(self, request_id: str) -> dict:
-        """Return one request with its full processing history."""
+        """Return one request with its full processing history.
+
+        The request row and its event history are two reads, and a decision
+        another process saves in between (approve/reject/revoke, saved
+        together with its history event) would otherwise be seen half-way:
+        a still-pending row paired with the new approval event, or an
+        approved row that already carries a revocation event. Both reads
+        therefore run inside one read snapshot against a fixed saved state,
+        exactly like ``list_exemptions``: the decision is seen either
+        wholly or not at all, so the status, decision handler/timestamp/
+        note, approved severity, revocation fields and the ordered event
+        history always describe the same instant. Showing the pre-save
+        state is a valid result; a follow-up query sees the completed save,
+        and no detail is cached beyond the query.
+
+        The snapshot is read-only and always rolled back: showing a request
+        never adds an event, changes a status, re-judges an expired request
+        or re-checks whether the target impact still exists, and a saved
+        request with its history is returned whatever the current directory
+        looks like. A caller-managed transaction is left untouched — the
+        reads share its view, including its own uncommitted changes, and
+        committing or rolling it back stays the caller's decision. A
+        database error from either read is propagated instead of yielding
+        a detail without history, and the same Catalog object stays usable
+        afterwards. An empty or unknown id keeps raising ``ValueError``.
+        """
         request_id = self._clean_text(request_id, "申请编号")
-        return self._fetch_request(request_id)
+        with self._read_snapshot():
+            return self._fetch_request(request_id)
 
     def list_exemptions(self, status: str | None = None) -> list[dict]:
         """List requests (with history), newest first, id as tiebreaker.
