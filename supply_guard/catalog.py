@@ -2351,12 +2351,22 @@ class Catalog:
         )
 
     def _fetch_request(self, request_id: str) -> dict:
-        row = self.connection.execute(
-            "SELECT * FROM exemption_requests WHERE id = ?", (request_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"未知申请编号: {request_id}")
-        return self._request_dict(row)
+        # The row and its history are read inside one read snapshot: a
+        # decision another process saves (status, decision fields and history
+        # event in one committed write transaction) between the two reads
+        # would otherwise stitch an old status to a newer event or a new
+        # status to dropped history. The snapshot makes both reads observe
+        # one saved instant — the detail is either wholly pre-save or
+        # wholly post-save. Inside a write transaction the same context
+        # manager simply shares that transaction, so the record returned at
+        # the end of a save is built from the transaction's own writes.
+        with self._read_snapshot():
+            row = self.connection.execute(
+                "SELECT * FROM exemption_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"未知申请编号: {request_id}")
+            return self._request_dict(row)
 
     @staticmethod
     def _event_dict(event: sqlite3.Row) -> dict:
@@ -2432,7 +2442,31 @@ class Catalog:
         }
 
     def get_exemption(self, request_id: str) -> dict:
-        """Return one request with its full processing history."""
+        """Return one request with its full processing history.
+
+        The request row and its complete history are read against one fixed
+        saved state: if another process approves, rejects or revokes this
+        request while the detail is being read, its save (status, handler,
+        decision time, note, approved severity and the history event, saved
+        together) is observed either wholly or not at all — never a pending
+        row carrying an approval event, an approved row carrying a revocation
+        event, or a detail whose history was dropped. The pre-save result is
+        a valid answer; a later query sees the completed save, since each
+        query opens a fresh snapshot and nothing is cached.
+
+        The read is strictly read-only: it never adds an event, changes a
+        status, re-judges an expired request or a target impact that has
+        disappeared, or repairs a record. Empty and unknown ids keep raising
+        ``ValueError``. A database error from either read fails the whole
+        query (no success detail with missing history) and the snapshot is
+        rolled back, so the same Catalog stays usable afterwards.
+
+        A transaction the caller opened is never touched: the reads share
+        its view, including the caller's own uncommitted changes, and
+        committing or rolling those changes back stays the caller's choice.
+        With no outer transaction the snapshot is rolled back when the query
+        finishes, leaving no transaction open.
+        """
         request_id = self._clean_text(request_id, "申请编号")
         return self._fetch_request(request_id)
 
