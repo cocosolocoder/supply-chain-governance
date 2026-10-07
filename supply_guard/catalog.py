@@ -1109,19 +1109,38 @@ class Catalog:
             raise ValueError("a component cannot depend on itself")
         if dependent[0] != dependency[0]:
             raise ValueError("dependencies must stay within the same service")
-        dependent_id = self._component_id(*dependent)
-        if dependent_id is None:
-            raise ValueError(
-                "dependent component is not registered: "
-                + self._format_identity(dependent)
-            )
-        dependency_id = self._component_id(*dependency)
-        if dependency_id is None:
-            raise ValueError(
-                "dependency component is not registered: "
-                + self._format_identity(dependency)
-            )
-        with self.connection:
+
+        # Resolve both endpoints by their full identity and insert the
+        # relationship in one serialized write transaction. The endpoints may
+        # be provided solely by imported manifests (no manual component
+        # registration), and another process can replace the owning source at
+        # any moment: resolving the ids first and inserting afterwards would
+        # leave a gap in which the source withdrawal can delete the old
+        # component rows (and a subsequent import can create different
+        # components that reuse the same row ids), so the edge could be
+        # attached to completely different components, or fail with a raw
+        # foreign-key error. BEGIN IMMEDIATE serializes this check-then-write
+        # against import_sbom, which writes through its own write lock: the
+        # two operations never interleave, so the result is exactly one of
+        # the two serial orders. If the replacement committed first and one
+        # of these exact identities is gone, fail naming that endpoint and
+        # its full identity instead of touching whatever took its place.
+        missing: list[str] = []
+        with self._write_tx():
+            dependent_id = self._component_id(*dependent)
+            if dependent_id is None:
+                missing.append(
+                    "dependent component is not registered: "
+                    + self._format_identity(dependent)
+                )
+            dependency_id = self._component_id(*dependency)
+            if dependency_id is None:
+                missing.append(
+                    "dependency component is not registered: "
+                    + self._format_identity(dependency)
+                )
+            if missing:
+                raise ValueError("; ".join(missing))
             self.connection.execute(
                 "INSERT INTO dependencies(dependent_id, dependency_id, manual) "
                 "VALUES (?, ?, 1) "
@@ -1270,7 +1289,14 @@ class Catalog:
             raise ValueError("service 和 source 名称不能为空")
         identities, edges = _parse_sbom(sbom)
 
-        with self.connection:
+        # BEGIN IMMEDIATE: take the write lock before any read so a concurrent
+        # add_dependency - which resolves the two endpoints and writes their
+        # relationship under the same write lock - can never interleave with
+        # this replacement (a deferred transaction reading under a SHARED
+        # lock and only upgrading when it writes could deadlock against a
+        # waiting writer, surfacing a raw "database is locked" error instead
+        # of one of the two serial orders).
+        with self._write_tx():
             source_row = self.connection.execute(
                 "SELECT id FROM sources WHERE service = ? AND name = ?",
                 (service, source_name),
