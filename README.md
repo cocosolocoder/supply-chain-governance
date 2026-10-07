@@ -53,6 +53,27 @@ Targeting a relationship or endpoint that does not exist succeeds without
 changing the catalog (and does not sweep unrelated components); empty identity
 fields are still rejected.
 
+The two endpoints only have to be present in the catalog at registration time
+— components provided solely by an imported manifest need no separate manual
+component registration. The endpoint existence checks and the relationship
+save run in one serialized write transaction, so a registration and a
+concurrent SBOM source replacement behave exactly as if one finished first.
+If the registration finishes first the relationship belongs to the exact two
+full identities given (service, ecosystem, package name and version), and a
+later withdrawal of the source keeps this manual relationship and the
+endpoints it needs under the retention rules above. If the source replacement
+commits first and removes a named endpoint, the registration fails naming
+which endpoint is missing and its full identity (the command exits non-zero
+and prints no success line); a same-named component in another version or
+service, or any other newly imported component — even one reusing a deleted
+row's id — is never accepted in place of the named endpoint. A replacement
+that keeps both named identities still allows the registration. A failed
+registration never adds a manual dependency to, or changes the retention
+basis of, any other component, while the already completed source
+replacement keeps its normal result. Re-registering a relationship a source
+already declares only adds the manual basis; the relationship stays a single
+row.
+
 A vulnerability that directly hits a component also affects everything that
 depends on it, transitively. `summary` counts all directly and indirectly
 affected components, and `impact` prints the per-component explanation as

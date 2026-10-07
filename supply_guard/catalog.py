@@ -1109,19 +1109,36 @@ class Catalog:
             raise ValueError("a component cannot depend on itself")
         if dependent[0] != dependency[0]:
             raise ValueError("dependencies must stay within the same service")
-        dependent_id = self._component_id(*dependent)
-        if dependent_id is None:
-            raise ValueError(
-                "dependent component is not registered: "
-                + self._format_identity(dependent)
-            )
-        dependency_id = self._component_id(*dependency)
-        if dependency_id is None:
-            raise ValueError(
-                "dependency component is not registered: "
-                + self._format_identity(dependency)
-            )
-        with self.connection:
+        # Resolve both endpoints and save the relationship inside one
+        # serialized write transaction. The existence checks and the insert
+        # used to be separate autocommit statements, so another process
+        # replacing an SBOM source in between could delete the resolved
+        # endpoints and import other components; the relationship then
+        # either landed on components the user never named (a same-named
+        # component in another version or service that happened to reuse a
+        # rowid) or failed with a raw foreign-key error. BEGIN IMMEDIATE
+        # serializes the registration against a source replacement, so the
+        # outcome is exactly as if one operation finished first: the
+        # registration wins and pins the original two components (a later
+        # source withdrawal still retains this manual edge and the endpoints
+        # it needs), or the replacement commits first and any named endpoint
+        # that disappeared is reported here by its full identity. Both ends
+        # are re-resolved inside the transaction by the full
+        # (service, ecosystem, name, version) tuple, so a newly imported
+        # component reusing an old rowid can never stand in for a named end.
+        with self._write_tx():
+            dependent_id = self._component_id(*dependent)
+            if dependent_id is None:
+                raise ValueError(
+                    "dependent component is not registered: "
+                    + self._format_identity(dependent)
+                )
+            dependency_id = self._component_id(*dependency)
+            if dependency_id is None:
+                raise ValueError(
+                    "dependency component is not registered: "
+                    + self._format_identity(dependency)
+                )
             self.connection.execute(
                 "INSERT INTO dependencies(dependent_id, dependency_id, manual) "
                 "VALUES (?, ?, 1) "
