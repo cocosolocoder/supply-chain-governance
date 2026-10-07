@@ -1212,6 +1212,29 @@ class Catalog:
         deleted_component_count = deleted_component_cursor.rowcount
         return deleted_component_count, deleted_dependency_count
 
+    def _resolve_dependency_edge(
+        self, dependent: tuple[str, ...], dependency: tuple[str, ...]
+    ) -> tuple[int, int, int] | None:
+        """Locate the exact relationship between two full component identities.
+
+        Returns ``(edge_id, dependent_id, dependency_id)``, or ``None`` when
+        either endpoint or the relationship itself is not registered. Both
+        endpoints are matched by their complete identity (service, ecosystem,
+        name, version), never by a previously resolved row id.
+        """
+        dependent_id = self._component_id(*dependent)
+        dependency_id = self._component_id(*dependency)
+        if dependent_id is None or dependency_id is None:
+            return None
+        edge_row = self.connection.execute(
+            "SELECT id FROM dependencies "
+            "WHERE dependent_id = ? AND dependency_id = ?",
+            (dependent_id, dependency_id),
+        ).fetchone()
+        if edge_row is None:
+            return None
+        return int(edge_row["id"]), dependent_id, dependency_id
+
     def remove_dependency(
         self,
         service: str,
@@ -1235,26 +1258,41 @@ class Catalog:
         )
         if any(not value for value in dependent + dependency):
             raise ValueError("dependency fields must not be empty")
-        dependent_id = self._component_id(*dependent)
-        dependency_id = self._component_id(*dependency)
-        if dependent_id is None or dependency_id is None:
-            # Nothing targeted: succeed without touching the catalog.
+
+        # Read-only pre-check, outside any transaction: a target that is
+        # clearly not registered succeeds without touching the catalog and
+        # without opening a write transaction. Revoking a non-existent
+        # manual registration must never be a way to sweep the endpoints (or
+        # any other component) through the cleanup rule.
+        if self._resolve_dependency_edge(dependent, dependency) is None:
             return
-        edge_row = self.connection.execute(
-            "SELECT id FROM dependencies "
-            "WHERE dependent_id = ? AND dependency_id = ?",
-            (dependent_id, dependency_id),
-        ).fetchone()
-        if edge_row is None:
-            # The two components exist but this relationship does not. Succeed
-            # without changing anything: revoking a non-existent manual
-            # registration must not be a way to sweep the endpoints (or any
-            # other component) through the cleanup rule.
-            return
-        edge_id = int(edge_row["id"])
-        with self.connection:
-            # Only revoke the manual registration; relationships still declared
-            # by an imported source continue to participate in impact queries.
+
+        # The target appears to exist: re-resolve it inside one serialized
+        # write transaction and revoke only that exact relationship. The
+        # endpoints and the edge may be held solely by imported manifests,
+        # and another process can remove this same relationship or replace
+        # the owning source at any moment: resolving the row ids first and
+        # writing afterwards would leave a gap in which the other removal
+        # commits, the old rows are deleted, and a different relationship
+        # (another version, another service, another pair of components)
+        # reuses the freed row ids - the revocation would then land on that
+        # unrelated relationship and the cleanup could sweep its endpoints.
+        # BEGIN IMMEDIATE serializes this check-then-write against
+        # remove_dependency, add_dependency and import_sbom, which all write
+        # through the same write lock: the operations never interleave, so
+        # the result is exactly one of the serial orders. If the other
+        # removal committed first and this exact relationship (or either
+        # endpoint) is gone, succeed without changing anything - the new
+        # relationship another process registered in between keeps its
+        # manual registration and its endpoints untouched.
+        with self._write_tx():
+            resolved = self._resolve_dependency_edge(dependent, dependency)
+            if resolved is None:
+                return
+            edge_id, dependent_id, dependency_id = resolved
+            # Only revoke the manual registration; relationships still
+            # declared by an imported source continue to participate in
+            # impact queries.
             self.connection.execute(
                 "UPDATE dependencies SET manual = 0 WHERE id = ?",
                 (edge_id,),
