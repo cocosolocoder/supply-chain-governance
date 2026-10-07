@@ -1235,26 +1235,51 @@ class Catalog:
         )
         if any(not value for value in dependent + dependency):
             raise ValueError("dependency fields must not be empty")
-        dependent_id = self._component_id(*dependent)
-        dependency_id = self._component_id(*dependency)
-        if dependent_id is None or dependency_id is None:
-            # Nothing targeted: succeed without touching the catalog.
+
+        # The edge is located by the *full identity* of both ends, never by a
+        # row id remembered across statements. This lock-free read is only the
+        # lenient fast path: when nothing matches the two identities (an
+        # endpoint was never registered or has left, or the two components
+        # exist without this relationship) the call succeeds without opening a
+        # write transaction or writing anything.
+        if self._dependency_edge(*dependent, *dependency) is None:
             return
-        edge_row = self.connection.execute(
-            "SELECT id FROM dependencies "
-            "WHERE dependent_id = ? AND dependency_id = ?",
-            (dependent_id, dependency_id),
-        ).fetchone()
-        if edge_row is None:
-            # The two components exist but this relationship does not. Succeed
-            # without changing anything: revoking a non-existent manual
-            # registration must not be a way to sweep the endpoints (or any
-            # other component) through the cleanup rule.
-            return
-        edge_id = int(edge_row["id"])
-        with self.connection:
+
+        # The real check-then-write runs in one serialized write transaction.
+        # Reading the endpoint and edge row ids first and writing afterwards
+        # would leave a gap in which another process can finish revoking this
+        # very relationship - the retention cleanup then deletes its rows and
+        # frees their ids - and a subsequent manual registration of a
+        # *different* relationship can create components and an edge that
+        # reuse those ids. The later write here would then clear the new
+        # edge's manual flag and scope its endpoint cleanup to the new
+        # components, silently revoking an unrelated relationship (another
+        # package, version or service) and deleting unrelated components, so
+        # the new relationship's vulnerability propagation would vanish.
+        # BEGIN IMMEDIATE serializes this resolution and the revocation
+        # against add_dependency and import_sbom, which take the same write
+        # lock: the operations never interleave, so the result is exactly one
+        # of the two serial orders.
+        with self._write_tx():
+            edge_row = self._dependency_edge(*dependent, *dependency)
+            if edge_row is None:
+                # The target was present at the unlocked read but vanished
+                # before this transaction took the write lock: another
+                # terminal completed the same revocation first. The catalog
+                # already holds the requested state, so succeed without
+                # changing it - whatever was registered in between keeps its
+                # own row ids and identities untouched.
+                return
+            edge_id = int(edge_row["edge_id"])
+            dependent_id = int(edge_row["dependent_id"])
+            dependency_id = int(edge_row["dependency_id"])
+
             # Only revoke the manual registration; relationships still declared
             # by an imported source continue to participate in impact queries.
+            # The row located above cannot have changed identity underneath us:
+            # the write lock blocks every other writer until this transaction
+            # ends, so this UPDATE and the scoped retention pass below can only
+            # ever affect the exact edge that joined to the named identities.
             self.connection.execute(
                 "UPDATE dependencies SET manual = 0 WHERE id = ?",
                 (edge_id,),
@@ -1268,6 +1293,50 @@ class Catalog:
                 candidate_dependency_ids={edge_id},
                 candidate_component_ids={dependent_id, dependency_id},
             )
+
+    def _dependency_edge(
+        self,
+        service: str,
+        ecosystem: str,
+        name: str,
+        version: str,
+        dependency_service: str,
+        dependency_ecosystem: str,
+        dependency_name: str,
+        dependency_version: str,
+    ) -> sqlite3.Row | None:
+        """Locate one relationship by the full identity of both endpoints.
+
+        Joining through the components table means the result can never be a
+        row that merely reused a freed id: every dependency row is bound to the
+        exact service/ecosystem/name/version pair the caller named. Returns
+        ``None`` when either endpoint is absent or the two components are not
+        connected by a relationship.
+        """
+        return self.connection.execute(
+            """
+            SELECT d.id AS edge_id,
+                   c1.id AS dependent_id,
+                   c2.id AS dependency_id
+            FROM dependencies d
+            JOIN components c1 ON c1.id = d.dependent_id
+            JOIN components c2 ON c2.id = d.dependency_id
+            WHERE c1.service = ? AND c1.ecosystem = ?
+              AND c1.name = ? AND c1.version = ?
+              AND c2.service = ? AND c2.ecosystem = ?
+              AND c2.name = ? AND c2.version = ?
+            """,
+            (
+                service,
+                ecosystem,
+                name,
+                version,
+                dependency_service,
+                dependency_ecosystem,
+                dependency_name,
+                dependency_version,
+            ),
+        ).fetchone()
 
     def import_sbom(
         self, service: str, source_name: str, sbom: object
